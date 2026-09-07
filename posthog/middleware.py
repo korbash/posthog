@@ -39,7 +39,7 @@ from statshog.defaults.django import statsd
 from posthog.api.shared import UserBasicSerializer
 from posthog.clickhouse.client.execute import clickhouse_query_counter
 from posthog.clickhouse.query_tagging import QueryCounter, get_query_tag_value, reset_query_tags, tag_queries
-from posthog.cloud_utils import is_cloud, is_dev_mode
+from posthog.cloud_utils import is_cloud, is_dev_mode, is_posthog_cloud_egress_enabled
 from posthog.constants import AUTH_BACKEND_KEYS
 from posthog.event_usage import get_event_source, get_mcp_properties, sanitize_header_value
 from posthog.geoip import get_geoip_properties
@@ -1169,16 +1169,21 @@ class CSPMiddleware:
                 # used by the error page
                 "frame-src https://posthog.com",
                 "base-uri 'self'",
-                "report-uri https://us.i.posthog.com/report/?token=sTMFPsFhdP1Ssg&v=2",
-                "report-to posthog",
             ]
 
-            # Browsers only deliver crash reports to the endpoint named `default`; the CSP
-            # `report-to posthog` directive keeps routing violations to `posthog`.
-            admin_report_endpoint = "https://us.i.posthog.com/report/?token=sTMFPsFhdP1Ssg&v=2"
-            response.headers["Reporting-Endpoints"] = (
-                f'posthog="{admin_report_endpoint}", default="{admin_report_endpoint}"'
-            )
+            if is_posthog_cloud_egress_enabled():
+                csp_parts.extend(
+                    [
+                        "report-uri https://us.i.posthog.com/report/?token=sTMFPsFhdP1Ssg&v=2",
+                        "report-to posthog",
+                    ]
+                )
+                # Browsers only deliver crash reports to the endpoint named `default`; the CSP
+                # `report-to posthog` directive keeps routing violations to `posthog`.
+                admin_report_endpoint = "https://us.i.posthog.com/report/?token=sTMFPsFhdP1Ssg&v=2"
+                response.headers["Reporting-Endpoints"] = (
+                    f'posthog="{admin_report_endpoint}", default="{admin_report_endpoint}"'
+                )
             response.headers["Content-Security-Policy"] = "; ".join(csp_parts)
         else:
             resource_url = "https://*.posthog.com"
@@ -1204,20 +1209,25 @@ class CSPMiddleware:
                 "frame-src https:",
                 "manifest-src 'self'",
                 "base-uri 'self'",
-                "report-uri https://us.i.posthog.com/report/?token=sTMFPsFhdP1Ssg&sample_rate=0.1&v=2",
-                "report-to posthog",
             ]
 
-            report_endpoint = "https://us.i.posthog.com/report/?token=sTMFPsFhdP1Ssg&sample_rate=0.1&v=2"
-            user = getattr(request, "user", None)
-            if user is not None and user.is_authenticated and getattr(user, "distinct_id", None):
-                # Crash reports arrive after the tab already died, so the report body is the
-                # only chance to attribute them; carrying the distinct_id in the endpoint URL
-                # ties the event to the person instead of a random per-report id.
-                report_endpoint += "&" + urlencode({"distinct_id": user.distinct_id})
-            # Browsers only deliver crash reports to the endpoint named `default`; the CSP
-            # `report-to posthog` directive keeps routing violations to `posthog`.
-            response.headers["Reporting-Endpoints"] = f'posthog="{report_endpoint}", default="{report_endpoint}"'
+            if is_posthog_cloud_egress_enabled():
+                csp_parts.extend(
+                    [
+                        "report-uri https://us.i.posthog.com/report/?token=sTMFPsFhdP1Ssg&sample_rate=0.1&v=2",
+                        "report-to posthog",
+                    ]
+                )
+                report_endpoint = "https://us.i.posthog.com/report/?token=sTMFPsFhdP1Ssg&sample_rate=0.1&v=2"
+                user = getattr(request, "user", None)
+                if user is not None and user.is_authenticated and getattr(user, "distinct_id", None):
+                    # Crash reports arrive after the tab already died, so the report body is the
+                    # only chance to attribute them; carrying the distinct_id in the endpoint URL
+                    # ties the event to the person instead of a random per-report id.
+                    report_endpoint += "&" + urlencode({"distinct_id": user.distinct_id})
+                # Browsers only deliver crash reports to the endpoint named `default`; the CSP
+                # `report-to posthog` directive keeps routing violations to `posthog`.
+                response.headers["Reporting-Endpoints"] = f'posthog="{report_endpoint}", default="{report_endpoint}"'
             response.headers["Content-Security-Policy-Report-Only"] = "; ".join(csp_parts)
 
         return response

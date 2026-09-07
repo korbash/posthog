@@ -189,7 +189,11 @@ export function loadPostHogJS(options: LoadPostHogJSOptions = {}): void {
         })
     } else {
         posthog.init('fake_token', {
+            api_host: window.location.origin,
             autocapture: false,
+            advanced_disable_decide: true,
+            disable_external_dependency_loading: true,
+            opt_out_capturing_by_default: true,
             loaded: function (ph) {
                 ph.opt_out_capturing()
             },

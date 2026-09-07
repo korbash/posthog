@@ -630,7 +630,7 @@ def setup_periodic_tasks(sender: Celery, **kwargs: Any) -> None:
         name="clear expired sessions",
     )
 
-    # Sync all Organization.available_product_features every hour, only for billing v1 orgs
+    # Persist the local entitlement profile so direct database readers see the same features as model and API callers.
     sender.add_periodic_task(crontab(minute="30", hour="*"), sync_all_organization_available_product_features.s())
 
     sender.add_periodic_task(crontab(minute="*/15"), check_async_migration_health.s())

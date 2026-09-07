@@ -18,6 +18,7 @@ import posthoganalytics
 
 from posthog.cache_utils import cache_for
 from posthog.clickhouse.query_tagging import Feature, Product, tag_queries
+from posthog.cloud_utils import is_posthog_cloud_egress_enabled
 from posthog.constants import FlagRequestType
 from posthog.dataclasses import frozen
 from posthog.event_usage import report_organization_action
@@ -237,6 +238,8 @@ def _get_previous_recordings_zset_tokens() -> set[str]:
 
 
 def is_team_limited(team_api_token: str, resource: QuotaResource, cache_key: QuotaLimitingCaches) -> bool:
+    if not is_posthog_cloud_egress_enabled():
+        return False
     limited_team_attributes = list_limited_team_attributes(resource, cache_key)
     return team_api_token in limited_team_attributes
 
@@ -249,6 +252,9 @@ def get_fresh_team_limited_resources(team_api_token: str) -> dict[QuotaResource,
     downstream for minutes (the LLM gateway) would re-cache a just-lifted limit as still
     limited. This reads the zset scores directly instead.
     """
+    if not is_posthog_cloud_egress_enabled():
+        return dict.fromkeys(QuotaResource, False)
+
     now_ts = timezone.now().timestamp()
     pipe = get_client().pipeline()
     for resource in QuotaResource:
@@ -682,6 +688,9 @@ def update_org_billing_quotas(organization: Organization):
     This method is basically update_all_orgs_billing_quotas but for a single org. It's called more often
     when the user loads the billing page and when usage reports are run.
     """
+    if not is_posthog_cloud_egress_enabled():
+        return None
+
     today_end = get_current_day().end
     if not organization.usage:
         return None
@@ -763,6 +772,9 @@ def refresh_org_self_driving_quota(organization_id: str) -> None:
     hours later, when the previous day's usage report lands in `organization.usage`; billing
     itself stays correct because that report queries yesterday's window with the PR present.
     """
+    if not is_posthog_cloud_egress_enabled():
+        return
+
     organization = Organization.objects.filter(id=organization_id).first()
     if organization is None or not organization.usage:
         return
@@ -1053,6 +1065,14 @@ def update_all_orgs_billing_quotas(
 
     # Start and end of the current day
     """
+    if not is_posthog_cloud_egress_enabled():
+        empty_limits: dict[str, dict[str, int]] = {resource.value: {} for resource in QuotaResource}
+        return QuotaLimitingRunResult(
+            quota_limited_orgs=empty_limits,
+            quota_limiting_suspended_orgs={resource.value: {} for resource in QuotaResource},
+            stats={"duration_s": 0, "orgs_total": 0, "orgs_processed": 0, "orgs_limited": 0, "orgs_suspended": 0},
+        )
+
     total_start = time()
     period = get_current_day()
 

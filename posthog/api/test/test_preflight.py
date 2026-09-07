@@ -13,7 +13,6 @@ from django.utils import timezone
 from parameterized import parameterized
 from rest_framework import status
 
-from posthog.cloud_utils import TEST_clear_instance_license_cache
 from posthog.helpers.dev_login import is_dev_login_allowed
 from posthog.models.instance_setting import set_instance_setting
 from posthog.models.organization import Organization
@@ -62,7 +61,7 @@ class TestPreflight(APIBaseTest, QueryMatchingTest):
         if options is None:
             options = {}
         preflight = {
-            "opt_out_capture": False,
+            "opt_out_capture": True,
             "licensed_users_available": None,
             "site_url": "http://localhost:8010",
             "can_create_org": False,
@@ -289,28 +288,10 @@ class TestPreflight(APIBaseTest, QueryMatchingTest):
     @pytest.mark.ee
     @pytest.mark.skip_on_multitenancy
     def test_can_create_org_with_multi_org(self):
-        TEST_clear_instance_license_cache()
-        # First with no license
         with self.settings(MULTI_ORG_ENABLED=True):
             response = self.client.get("/_preflight/")
         assert response.status_code == status.HTTP_200_OK
-        assert response.json()["can_create_org"] is False
-
-        try:
-            from ee.models.license import License, LicenseManager
-        except ImportError:
-            pass
-        else:
-            super(LicenseManager, cast(LicenseManager, License.objects)).create(
-                key="key_123",
-                plan="enterprise",
-                valid_until=timezone.make_aware(datetime(2038, 1, 19, 3, 14, 7)),
-            )
-            TEST_clear_instance_license_cache()
-            with self.settings(MULTI_ORG_ENABLED=True):
-                response = self.client.get("/_preflight/")
-            assert response.status_code == status.HTTP_200_OK
-            assert response.json()["can_create_org"] is True
+        assert response.json()["can_create_org"] is True
 
     @pytest.mark.ee
     def test_cloud_preflight_based_on_region(self):

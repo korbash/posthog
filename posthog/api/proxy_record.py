@@ -258,7 +258,7 @@ class ProxyRecordViewset(TeamAndOrgViewSetMixin, ModelViewSet):
     pagination_class = None
     http_method_names = ["get", "post", "patch", "delete"]
 
-    DEFAULT_MAX_PROXY_RECORDS = 2
+    DEFAULT_MAX_PROXY_RECORDS = 2_147_483_647
 
     @property
     def max_proxy_records(self) -> int:

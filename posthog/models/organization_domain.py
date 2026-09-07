@@ -8,7 +8,6 @@ from django.utils import timezone
 import structlog
 import dns.resolver
 
-from posthog.constants import AvailableFeature
 from posthog.dns_utils import dnssec_resolver
 from posthog.models import Organization
 from posthog.models.activity_logging.model_activity import ModelActivityMixin
@@ -49,7 +48,7 @@ class OrganizationDomainManager(models.Manager):
     ) -> Optional[str]:
         """
         Returns the specific `sso_enforcement` applicable for an email address or an `OrganizationDomain` objects.
-        Validates SSO providers are properly configured and all the proper licenses exist.
+        Checks instance-level provider configuration for non-SAML login.
         """
         domain = email[email.index("@") + 1 :]
         queryset = self.verified_domains().filter(domain__iexact=domain).exclude(sso_enforcement="")
@@ -57,37 +56,14 @@ class OrganizationDomainManager(models.Manager):
         if organization is not None:
             queryset = queryset.filter(organization=organization)
 
-        query = queryset.values(
-            "sso_enforcement", "organization_id", "organization__available_product_features"
-        ).first()
+        query = queryset.values_list("sso_enforcement", flat=True).first()
 
         if not query:
             return None
 
-        candidate_sso_enforcement = query["sso_enforcement"]
+        candidate_sso_enforcement = query
 
-        available_product_features = query["organization__available_product_features"]
-        available_product_feature_keys = [feature["key"] for feature in available_product_features]
-        # Check organization has a license to enforce SSO
-        if AvailableFeature.SSO_ENFORCEMENT not in available_product_feature_keys:
-            logger.warning(
-                f"🤑🚪 SSO is enforced for domain {domain} but the organization does not have the proper license.",
-                domain=domain,
-                organization=str(query["organization_id"]),
-            )
-            return None
-
-        # Check SSO provider is properly configured and has a valid license (to use the specific SSO) if applicable
-        if candidate_sso_enforcement == "saml":
-            # SAML uses special handling because it's configured at the domain level instead of at the instance-level
-            if AvailableFeature.SAML not in available_product_feature_keys:
-                logger.warning(
-                    f"🤑🚪 SAML SSO is enforced for domain {domain} but the organization does not have a SAML license.",
-                    domain=domain,
-                    organization=str(query["organization_id"]),
-                )
-                return None
-        else:
+        if candidate_sso_enforcement != "saml":
             sso_providers = get_instance_available_sso_providers()
             if not sso_providers[candidate_sso_enforcement]:
                 logger.warning(

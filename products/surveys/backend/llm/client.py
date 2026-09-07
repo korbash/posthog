@@ -20,11 +20,6 @@ T = TypeVar("T", bound=BaseModel)
 
 
 def create_gemini_client():
-    if settings.DEBUG and posthoganalytics.disabled:
-        posthoganalytics.disabled = False
-        if not posthoganalytics.host:
-            posthoganalytics.host = settings.SITE_URL
-
     posthog_client = posthoganalytics.default_client
     if not posthog_client:
         logger.warning("PostHog default_client not available, AI observability will not be tracked")

@@ -1,4 +1,3 @@
-import os
 import atexit
 import threading
 from collections.abc import Mapping
@@ -12,7 +11,7 @@ from django.conf import settings
 import structlog
 import posthoganalytics
 
-from posthog.cloud_utils import is_cloud
+from posthog.cloud_utils import is_cloud, is_posthog_cloud_egress_enabled
 from posthog.utils import get_instance_region
 
 PH_US_API_KEY = "sTMFPsFhdP1Ssg"
@@ -192,10 +191,12 @@ def get_client(region: str = "US", **kwargs: Any):
     else:
         return
 
-    # A fresh client does not inherit the module-level `disabled` flag that apps.py sets
-    # under TEST, so without this a test that runs in cloud mode captures to the real
-    # project. Callers can still pass `disabled` explicitly to override.
-    kwargs.setdefault("disabled", bool(settings.TEST or os.environ.get("OPT_OUT_CAPTURE", False)))
+    # A fresh client does not inherit the module-level `disabled` flag that apps.py sets.
+    # The self-hosted policy cannot be overridden by an individual caller.
+    if not is_posthog_cloud_egress_enabled():
+        kwargs["disabled"] = True
+    else:
+        kwargs.setdefault("disabled", bool(settings.TEST))
 
     return Posthog(
         api_key,

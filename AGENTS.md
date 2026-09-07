@@ -1,5 +1,39 @@
 # PostHog Development Guide
 
+## Fork updates: mandatory telemetry verification
+
+This fork must not send its own telemetry or billing data to PostHog Cloud. After every
+`git merge` that updates the fork, including a clean merge or fast-forward, verify that
+this behavior still holds before reporting the update as verified. Apply the same check
+after a rebase, cherry-pick, or SDK dependency update that can affect these paths.
+
+Follow [the fork update checklist](docs/selfhost-upstream-update-checklist.md): inspect
+incoming network clients and changes to existing interception points, run the focused
+regression tests, and check browser/server behavior with outbound Cloud traffic blocked
+and attempted requests recorded. A conflict-free merge or a disabled SDK flag alone is
+not evidence that no data is sent. Report any checks that could not run as unverified.
+
+Keep fork changes small and concentrated at shared boundaries. Preserve upstream
+interfaces and unrelated logic; do not replace whole subsystems or discard upstream
+tests merely to resolve a merge. Telemetry no-ops must preserve caller response contracts,
+stored organization features, and customer-data ingestion. Do not send tooling telemetry
+(including `hogli devex:feedback`) while checking this fork. This overrides the general
+feedback instruction below. Do not commit or push unless authorized by the user.
+
+## Self-hosted website SDK: explicit ingestion destination required
+
+When configuring or documenting event capture from a customer's website, always set
+`api_host` in `posthog.init(...)` to the browser-accessible HTTPS URL of this self-hosted
+instance's ingestion endpoint, or a customer-controlled reverse proxy forwarding to it.
+Use the project token from that same instance. Never omit `api_host` or retain the SDK's
+Cloud default (`https://us.i.posthog.com` in the currently installed SDK): website events
+will not reach this installation. `ui_host` and the server's `SITE_URL` do not replace
+this SDK option. Disabling this fork's own telemetry does not configure customer SDKs.
+
+After deployment or SDK/config updates, verify the effective browser configuration and
+request destinations, then confirm a synthetic event appears in the intended local project.
+Follow the website SDK steps in [the checklist](docs/selfhost-upstream-update-checklist.md).
+
 ## Codebase Structure
 
 - Key entry points: `posthog/api/__init__.py` (API URL routing skeleton; products register their own routes in `products/<name>/backend/routes.py` via `register_routes(routers)`), `posthog/settings/web.py` (Django settings, INSTALLED_APPS), `products/` (product apps)

@@ -19,7 +19,7 @@ import dateutil.parser
 from rest_framework import exceptions
 
 from posthog.cloud_utils import is_cloud
-from posthog.constants import INVITE_DAYS_VALIDITY, MAX_SLUG_LENGTH, AvailableFeature
+from posthog.constants import INVITE_DAYS_VALIDITY, MAX_SLUG_LENGTH, UNLIMITED_PRODUCT_FEATURE_KEYS, AvailableFeature
 from posthog.dataclasses import frozen
 from posthog.models.activity_logging.model_activity import ModelActivityMixin
 from posthog.models.personal_api_key import PersonalAPIKey
@@ -83,6 +83,21 @@ class ProductFeature(TypedDict):
     limit: int | None
     note: str | None
     is_plan_default: bool
+
+
+def get_unlimited_product_features() -> list[ProductFeature]:
+    return [
+        {
+            "key": key,
+            "name": key.replace("_", " ").capitalize(),
+            "description": "",
+            "unit": "years" if key == AvailableFeature.SESSION_REPLAY_DATA_RETENTION else None,
+            "limit": 5 if key == AvailableFeature.SESSION_REPLAY_DATA_RETENTION else None,
+            "note": None,
+            "is_plan_default": True,
+        }
+        for key in sorted(UNLIMITED_PRODUCT_FEATURE_KEYS)
+    ]
 
 
 @functools_cache
@@ -381,41 +396,17 @@ class Organization(ModelActivityMixin, UUIDTModel):
                 return (license.plan, "ee")
         return (None, None)
 
-    def update_available_product_features(self) -> list[ProductFeature]:
-        """Updates field `available_product_features`. Does not `save()`."""
-        if is_cloud() or self.usage:
-            # Since billing V2 we just use the field which is updated when the billing service is called
-            return self.available_product_features or []
-
-        try:
-            from ee.models.license import License
-        except ImportError:
-            self.available_product_features = []
-            return []
-
-        self.available_product_features = []
-
-        # Self hosted legacy license so we just sync the license features
-        # Demo gets all features
-        if settings.DEMO or "generate_demo_data" in sys.argv[1:2]:
-            features = License.PLANS.get(License.ENTERPRISE_PLAN, [])
-            self.available_product_features = [
-                {"key": feature, "name": " ".join(feature.split(" ")).capitalize()} for feature in features
-            ]
-        else:
-            # Otherwise, try to find a valid license on this instance
-            license = License.objects.first_valid()
-            if license:
-                features = License.PLANS.get(License.ENTERPRISE_PLAN, [])
-                self.available_product_features = [
-                    {"key": feature, "name": " ".join(feature.split(" ")).capitalize()} for feature in features
-                ]
-
+    def update_available_product_features(self, *, save: bool = False) -> list[ProductFeature]:
+        features = get_unlimited_product_features()
+        if self.available_product_features != features:
+            self.available_product_features = features
+            if save:
+                self.save(update_fields=["available_product_features"])
         return self.available_product_features
 
     def get_available_feature(self, feature: Union[AvailableFeature, str]) -> ProductFeature | None:
         return next(
-            filter(lambda f: f and f.get("key") == feature, self.available_product_features or []),
+            filter(lambda item: item and item.get("key") == feature, self.available_product_features or []),
             None,
         )
 

@@ -28,7 +28,7 @@ from opentelemetry import trace
 from posthog.api.capture import capture_internal
 from posthog.api.secret_revocation import NON_PERSONAL_SECRET_PREFIXES
 from posthog.auth import AUTH_BRAND_COOKIE, apply_auth_brand_cookie, normalize_auth_brand
-from posthog.cloud_utils import is_cloud
+from posthog.cloud_utils import is_cloud, is_posthog_cloud_egress_enabled
 from posthog.email import is_email_available
 from posthog.exceptions_capture import capture_exception
 from posthog.health import is_clickhouse_connected, is_kafka_connected
@@ -253,7 +253,7 @@ def preflight_check(request: HttpRequest) -> JsonResponse:
         response = {
             **response,
             "available_timezones": _traced("preflight.available_timezones", get_available_timezones_with_offsets),
-            "opt_out_capture": os.environ.get("OPT_OUT_CAPTURE", False),
+            "opt_out_capture": not is_posthog_cloud_egress_enabled(),
             "licensed_users_available": _traced("preflight.licensed_users_available", get_licensed_users_available)
             if not in_cloud
             else None,

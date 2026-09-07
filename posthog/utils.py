@@ -40,7 +40,7 @@ import orjson
 import lzstring
 import structlog
 import posthoganalytics
-from asgiref.sync import async_to_sync, sync_to_async
+from asgiref.sync import async_to_sync
 from celery.result import AsyncResult
 from celery.schedules import crontab
 from dateutil import parser
@@ -51,8 +51,7 @@ from rest_framework import serializers
 from rest_framework.request import Request
 from rest_framework.utils.encoders import JSONEncoder
 
-from posthog.cloud_utils import get_cached_instance_license, is_cloud
-from posthog.constants import AvailableFeature
+from posthog.cloud_utils import is_cloud, is_posthog_cloud_egress_enabled
 from posthog.exceptions import RequestParsingError, UnspecifiedCompressionFallbackParsingError
 from posthog.exceptions_capture import capture_exception
 from posthog.git import get_git_branch, get_git_commit_short
@@ -505,8 +504,8 @@ def _build_template_context(
     if context is None:
         context = {}
 
-    context["opt_out_capture"] = settings.OPT_OUT_CAPTURE
-    context["self_capture"] = settings.SELF_CAPTURE
+    context["opt_out_capture"] = not is_posthog_cloud_egress_enabled()
+    context["self_capture"] = False
     context["region"] = get_instance_region()
 
     if settings.STRIPE_PUBLIC_KEY:
@@ -538,31 +537,6 @@ def _build_template_context(
 
     if settings.E2E_TESTING:
         context["e2e_testing"] = True
-        context["js_posthog_api_key"] = "phc_ex7Mnvi4DqeB6xSQoXU1UVPzAmUIpiciRKQQXGGTYQO"
-        context["js_posthog_host"] = "https://internal-j.posthog.com"
-        context["js_posthog_ui_host"] = "https://us.posthog.com"
-
-    elif settings.SELF_CAPTURE:
-        # posthog-js uses this token to evaluate PostHog's own gating flags, so it must point at the
-        # team the server-side bootstrap evaluates against via _build_flag_provider(). Both resolve
-        # through resolve_self_flags_team() for that reason: the POSTHOG_SELF_TEAM_ID override when
-        # it is set, else the dogfood-flags team that `sync_feature_flags_from_api` writes to. Do NOT
-        # use the self-capture team here (posthoganalytics.api_key = most-recently-active user's
-        # current_team): it drifts onto demo teams that hold no internal flags, so flags load from
-        # the bootstrap and then vanish the moment posthog-js reloads them against that team.
-        self_flags_team = resolve_self_flags_team()
-        if self_flags_team is not None:
-            context["js_posthog_api_key"] = self_flags_team.api_token
-            context["js_posthog_host"] = ""  # Becomes location.origin in the frontend
-        elif get_explicit_self_team_id() is None and posthoganalytics.api_key:
-            # Only reachable without an override. A pinned team that does not exist leaves the token
-            # unset, because sending any other team's token is the mismatch described above.
-            context["js_posthog_api_key"] = posthoganalytics.api_key
-            context["js_posthog_host"] = ""  # Becomes location.origin in the frontend
-    else:
-        context["js_posthog_api_key"] = "sTMFPsFhdP1Ssg"
-        context["js_posthog_host"] = "https://internal-j.posthog.com"
-        context["js_posthog_ui_host"] = "https://us.posthog.com"
 
     context["js_capture_time_to_see_data"] = settings.CAPTURE_TIME_TO_SEE_DATA
     context["js_url"] = get_js_url(request)
@@ -907,32 +881,8 @@ def _build_flag_provider() -> "HyperCacheFlagProvider":
     return HyperCacheFlagProvider.for_static_team(2)
 
 
-async def initialize_self_capture_api_token():
-    """Configure `posthoganalytics` for self-capture, ASGI-compatible (async).
-
-    Overwrites process-global SDK config (api_key, host, disabled, and the
-    flag-definition cache provider) from the DB-resolved self-capture team — the
-    async counterpart to PostHogConfig.ready()'s WSGI path. Mainly the local dev
-    self-capture bootstrap; also invoked by the Dagster PostHogAnalyticsResource.
-    """
-    team = await sync_to_async(resolve_self_capture_team)()
-    local_api_key = team.api_token if team else None
-
-    # This is running _after_ PostHogConfig.ready(), so we re-enable posthoganalytics while setting the params
-    if local_api_key is not None:
-        posthoganalytics.disabled = False
-        posthoganalytics.api_key = local_api_key
-        posthoganalytics.host = settings.SITE_URL
-
-        # ready() wires the flag-definition provider only when posthoganalytics is enabled at
-        # that point — true for WSGI but NOT for ASGI, where self-capture is deferred to here.
-        # Without this the ASGI process has no local flag definitions and falls back to a remote
-        # flags call against SITE_URL (unreachable server-side in dev), so feature_enabled()
-        # always returns False. Mirror ready() so ASGI evaluates flags from HyperCache too.
-        posthoganalytics.flag_definition_cache_provider = _build_flag_provider()  # ty: ignore[invalid-assignment]
-
-        if posthoganalytics.feature_flag_definitions() is None:
-            await sync_to_async(posthoganalytics.load_feature_flags)()
+async def initialize_self_capture_api_token() -> None:
+    return None
 
 
 BOTH_DEFAULTS_PRESENT_TTL_SECONDS = 24 * 60 * 60
@@ -1562,7 +1512,7 @@ def get_can_create_org(user: Union["AbstractBaseUser", "AnonymousUser"]) -> bool
     - if running end-to-end tests
     - if there's no organization yet
     - if DEBUG is True
-    - if an appropriate license is active and MULTI_ORG_ENABLED is True
+    - if MULTI_ORG_ENABLED is True
     """
     from posthog.models.organization import Organization
 
@@ -1576,11 +1526,7 @@ def get_can_create_org(user: Union["AbstractBaseUser", "AnonymousUser"]) -> bool
         return True
 
     if settings.MULTI_ORG_ENABLED:
-        license = get_cached_instance_license()
-        if license is not None and AvailableFeature.ZAPIER in license.available_features:
-            return True
-        else:
-            logger.warning("You have configured MULTI_ORG_ENABLED, but not the required premium PostHog plan!")
+        return True
 
     return False
 
@@ -1589,7 +1535,7 @@ def get_instance_available_sso_providers() -> dict[str, bool]:
     """
     Returns a dictionary containing final determination to which SSO providers are available.
     SAML is not included in this method as it can only be configured domain-based and not instance-based (see `OrganizationDomain` for details)
-    Validates configuration settings and license validity (if applicable).
+    Validates the provider configuration settings.
     """
     output: dict[str, bool] = {
         "github": bool(settings.SOCIAL_AUTH_GITHUB_KEY and settings.SOCIAL_AUTH_GITHUB_SECRET),
@@ -1597,26 +1543,12 @@ def get_instance_available_sso_providers() -> dict[str, bool]:
         "google-oauth2": False,
     }
 
-    # Get license information
-    bypass_license: bool = is_cloud() or settings.DEMO
-    license = None
-    if not bypass_license:
-        try:
-            from ee.models.license import License
-        except ImportError:
-            pass
-        else:
-            license = License.objects.first_valid()
-
     if getattr(settings, "SOCIAL_AUTH_GOOGLE_OAUTH2_KEY", None) and getattr(
         settings,
         "SOCIAL_AUTH_GOOGLE_OAUTH2_SECRET",
         None,
     ):
-        if bypass_license or (license is not None and AvailableFeature.SOCIAL_SSO in license.available_features):
-            output["google-oauth2"] = True
-        else:
-            logger.warning("You have Google login set up, but not the required license!")
+        output["google-oauth2"] = True
 
     return output
 

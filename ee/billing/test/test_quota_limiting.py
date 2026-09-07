@@ -30,6 +30,7 @@ from ee.billing.quota_limiting import (
     _patch_todays_usage,
     add_limited_team_tokens,
     get_team_attribute_by_quota_resource,
+    is_team_limited,
     list_limited_team_attributes,
     org_quota_limited_until,
     refresh_org_self_driving_quota,
@@ -52,6 +53,9 @@ class TestQuotaLimiting(BaseTest):
 
     def setUp(self) -> None:
         super().setUp()
+        egress_patch = patch("ee.billing.quota_limiting.is_posthog_cloud_egress_enabled", return_value=True)
+        egress_patch.start()
+        self.addCleanup(egress_patch.stop)
         self.redis_client = get_client()
         self.redis_client.delete(f"@posthog/quota-limits/events")
         self.redis_client.delete(f"@posthog/quota-limits/exceptions")
@@ -74,6 +78,28 @@ class TestQuotaLimiting(BaseTest):
         self.redis_client.delete(f"@posthog/quota-limiting-suspended/cdp_trigger_events")
         self.redis_client.delete(f"@posthog/quota-limiting-suspended/ai_credits")
         materialize("events", "$exception_values")
+
+    def test_local_entitlements_do_not_mutate_quota_state(self) -> None:
+        expires_at = int((timezone.now() + datetime.timedelta(days=1)).timestamp())
+        token = self.team.api_token
+        self.redis_client.zadd("@posthog/quota-limits/events", {token: expires_at})
+        self.redis_client.zadd("@posthog/quota-limits/recordings", {token: expires_at})
+        self.redis_client.zadd("@posthog/quota-limiting-suspended/events", {token: expires_at})
+        expected_events = self.redis_client.zrange("@posthog/quota-limits/events", 0, -1)
+        expected_recordings = self.redis_client.zrange("@posthog/quota-limits/recordings", 0, -1)
+        expected_suspended_events = self.redis_client.zrange("@posthog/quota-limiting-suspended/events", 0, -1)
+
+        with patch("ee.billing.quota_limiting.is_posthog_cloud_egress_enabled", return_value=False):
+            assert not is_team_limited(token, QuotaResource.EVENTS, QuotaLimitingCaches.QUOTA_LIMITER_CACHE_KEY)
+            update_org_billing_quotas(self.organization)
+            result = update_all_orgs_billing_quotas()
+
+        assert self.redis_client.zrange("@posthog/quota-limits/events", 0, -1) == expected_events
+        assert self.redis_client.zrange("@posthog/quota-limits/recordings", 0, -1) == expected_recordings
+        assert self.redis_client.zrange("@posthog/quota-limiting-suspended/events", 0, -1) == expected_suspended_events
+        assert self.redis_client.get(f"quota:generation:team:{self.team.id}") is None
+        assert result.quota_limited_orgs == {resource.value: {} for resource in QuotaResource}
+        assert result.quota_limiting_suspended_orgs == {resource.value: {} for resource in QuotaResource}
 
     @patch("posthoganalytics.capture")
     @patch("posthoganalytics.feature_enabled", return_value=True)
@@ -2986,6 +3012,21 @@ class TestSignalsRefundQuotaOffset(BaseTest):
 
 
 class TestRefreshOrgSelfDrivingQuota(BaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        egress_patch = patch("ee.billing.quota_limiting.is_posthog_cloud_egress_enabled", return_value=True)
+        egress_patch.start()
+        self.addCleanup(egress_patch.stop)
+
+    def test_local_entitlements_skip_self_driving_quota_refresh(self) -> None:
+        with (
+            patch("ee.billing.quota_limiting.is_posthog_cloud_egress_enabled", return_value=False),
+            patch("ee.billing.quota_limiting.get_self_driving_credits_used_in_period_for_org") as live_mock,
+        ):
+            refresh_org_self_driving_quota(str(self.organization.id))
+
+        live_mock.assert_not_called()
+
     def _set_self_driving_usage(self, usage: int, *, todays_usage: int = 0, limit: int = 4500) -> None:
         self.organization.usage = {
             "signals_credits": {"usage": usage, "todays_usage": todays_usage, "limit": limit},

@@ -11,7 +11,6 @@ from freezegun import freeze_time
 from posthog.test.base import BaseTest
 from unittest.mock import call, patch
 
-from django.contrib.auth.models import AnonymousUser
 from django.core.cache import cache
 from django.core.handlers.wsgi import WSGIRequest
 from django.http import HttpRequest
@@ -19,6 +18,8 @@ from django.test import SimpleTestCase, TestCase, override_settings
 from django.test.client import RequestFactory
 from django.utils.timezone import now
 
+import posthoganalytics
+from asgiref.sync import async_to_sync
 from parameterized import parameterized
 from rest_framework.request import Request
 
@@ -44,7 +45,6 @@ from posthog.utils import (
     format_query_params_absolute_url,
     get_available_timezones_with_offsets,
     get_compare_period_dates,
-    get_context_for_template,
     get_default_event_info,
     get_default_event_name,
     get_dogfood_flags_team_id,
@@ -53,6 +53,7 @@ from posthog.utils import (
     get_js_url,
     get_self_capture_team_id,
     get_short_user_agent,
+    initialize_self_capture_api_token,
     load_data_from_request,
     refresh_requested_by_client,
     relative_date_parse,
@@ -1244,6 +1245,18 @@ class TestTemplateContextHistogram(TestCase):
         assert self._count_for_labels("index.html", expected_label) == before + 1
 
 
+class TestInitializeSelfCapture(SimpleTestCase):
+    def test_is_a_no_op(self) -> None:
+        with (
+            patch.object(posthoganalytics, "disabled", True),
+            patch.object(posthoganalytics, "api_key", "unchanged"),
+        ):
+            async_to_sync(initialize_self_capture_api_token)()
+
+            assert posthoganalytics.disabled is True
+            assert posthoganalytics.api_key == "unchanged"
+
+
 class TestResolveSelfCaptureTeam(TestCase):
     PASSWORD = "testpassword12345"
 
@@ -1404,80 +1417,6 @@ class TestBuildFlagProvider(TestCase):
     @override_settings(SELF_CAPTURE=False, E2E_TESTING=False, CLOUD_DEPLOYMENT="EU")
     def test_explicit_env_team_id_wins_over_eu_region(self):
         assert _build_flag_provider()._resolve_team_id() == 5
-
-
-class TestSelfCaptureBrowserFlagToken(TestCase):
-    PASSWORD = "testpassword12345"
-
-    def setUp(self):
-        super().setUp()
-        # The dogfood branch reads the whole teams table; clear ambient rows so the team we create
-        # is the first one. Cascade deletes roll back with the test transaction.
-        User.objects.all().delete()
-        Organization.objects.all().delete()
-        # POSTHOG_SELF_TEAM_ID steers the browser token as well as the flag provider, so set the
-        # environment per test instead of inheriting whatever the ambient one holds.
-        env_patch = patch.dict(os.environ, {}, clear=False)
-        env_patch.start()
-        self.addCleanup(env_patch.stop)
-        os.environ.pop("POSTHOG_SELF_TEAM_ID", None)
-
-    @override_settings(SELF_CAPTURE=True, E2E_TESTING=False)
-    def test_browser_token_uses_dogfood_flags_team_not_self_capture_team(self):
-        # js_posthog_api_key is the token posthog-js evaluates PostHog's own flags with, so it must
-        # be the dogfood-flags team (first team, where flags are synced) even when a more-recently
-        # active user's current_team points at another team that holds no internal flags. Sourcing
-        # it from the self-capture team instead made local flags load then vanish on reload.
-        organization = Organization.objects.create(name="Org")
-        first_team = Team.objects.create(organization=organization, name="First")
-        recent_team = Team.objects.create(organization=organization, name="Recent")
-
-        recent_user = User.objects.create_and_join(organization, "recent@posthog.com", self.PASSWORD)
-        recent_user.current_team = recent_team
-        recent_user.last_login = datetime(2026, 1, 2, tzinfo=ZoneInfo("UTC"))
-        recent_user.save()
-
-        request = RequestFactory().get("/?no-preloaded-app-context=1")
-        request.user = AnonymousUser()
-
-        context = get_context_for_template("head.html", request)
-
-        assert context["js_posthog_api_key"] == first_team.api_token
-        assert first_team.api_token != recent_team.api_token
-
-    @override_settings(SELF_CAPTURE=True, E2E_TESTING=False)
-    def test_browser_token_honors_explicit_self_team_id(self):
-        # A deploy that pins POSTHOG_SELF_TEAM_ID bootstraps flags from that team, so the browser
-        # token has to follow the pin. Reading the first team by PK instead hands posthog-js the
-        # token of whichever team is oldest, which on a long-lived deploy is a seed team that holds
-        # no internal flag definitions.
-        organization = Organization.objects.create(name="Org")
-        first_team = Team.objects.create(organization=organization, name="First")
-        pinned_team = Team.objects.create(organization=organization, name="Pinned")
-
-        request = RequestFactory().get("/?no-preloaded-app-context=1")
-        request.user = AnonymousUser()
-
-        os.environ["POSTHOG_SELF_TEAM_ID"] = str(pinned_team.id)
-        context = get_context_for_template("head.html", request)
-
-        assert context["js_posthog_api_key"] == pinned_team.api_token
-        assert pinned_team.api_token != first_team.api_token
-
-    @override_settings(SELF_CAPTURE=True, E2E_TESTING=False)
-    def test_browser_token_unset_when_pinned_team_is_absent(self):
-        # The provider still pins flag definitions to the missing id, so falling back to another
-        # team's token would recreate the mismatch the pin exists to remove.
-        organization = Organization.objects.create(name="Org")
-        Team.objects.create(organization=organization, name="First")
-
-        request = RequestFactory().get("/?no-preloaded-app-context=1")
-        request.user = AnonymousUser()
-
-        os.environ["POSTHOG_SELF_TEAM_ID"] = "987654321"
-        context = get_context_for_template("head.html", request)
-
-        assert context.get("js_posthog_api_key") is None
 
 
 VALID_PRELOAD_MANIFEST = {

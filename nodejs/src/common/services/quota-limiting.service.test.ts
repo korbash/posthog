@@ -1,56 +1,23 @@
-import { closeHub, createHub } from '~/common/utils/db/hub'
-import { createTeam, createTestTeamFixture, getTeam } from '~/tests/helpers/sql'
-import { Hub, RedisPool, Team } from '~/types'
+import { TeamManager } from '~/common/utils/team-manager'
+import { RedisPool } from '~/types'
 
-import { QUOTA_LIMITER_CACHE_KEY, QuotaLimiting, QuotaResource } from './quota-limiting.service'
+import { QuotaLimiting } from './quota-limiting.service'
 
 describe('QuotaLimiting', () => {
-    jest.setTimeout(2000)
-    let hub: Hub
-    let service: QuotaLimiting
-    let redisPool: RedisPool
-    let team: Team
-    let team2: Team
+    it('allows ingestion without looking up teams or billing quotas', async () => {
+        const acquire = jest.fn(() => {
+            throw new Error('Unexpected Redis access')
+        })
+        const getTeam = jest.fn(() => {
+            throw new Error('Unexpected team lookup')
+        })
+        const service = new QuotaLimiting({ acquire } as unknown as RedisPool, { getTeam } as unknown as TeamManager)
 
-    const setupQuotaLimits = async (resource: QuotaResource, quotas: { token: string; limitedUntil: number }[]) => {
-        const redis = await redisPool.acquire()
-        await redis.del(QUOTA_LIMITER_CACHE_KEY + resource)
-        for (const quota of quotas) {
-            // NOTE: the python service stores this as seconds since epoch, so we need to convert to seconds
-            await redis.zadd(QUOTA_LIMITER_CACHE_KEY + resource, Math.floor(quota.limitedUntil / 1000), quota.token)
-        }
-        await redisPool.release(redis)
-    }
-
-    beforeEach(async () => {
-        hub = await createHub()
-        redisPool = hub.redisPool
-        service = new QuotaLimiting(redisPool, hub.teamManager)
-        const fixture = await createTestTeamFixture(hub.postgres)
-        team = fixture.team
-
-        const otherTeamId = await createTeam(hub.postgres, team.organization_id)
-        team2 = (await getTeam(hub.postgres, otherTeamId))!
-
-        await setupQuotaLimits('events', [])
-    })
-
-    afterEach(async () => {
-        await closeHub(hub)
-    })
-
-    it('should return false if no quota limits in place', async () => {
-        expect(await service.isTeamQuotaLimited(team.id, 'events')).toBe(false)
-    })
-
-    it('should return true if quota limits in place', async () => {
-        await setupQuotaLimits('events', [{ token: team.api_token, limitedUntil: Date.now() + 10000 }])
-        expect(await service.isTeamQuotaLimited(team.id, 'events')).toBe(true)
-        expect(await service.isTeamQuotaLimited(team2.id, 'events')).toBe(false)
-    })
-
-    it('should return false if quota limits in place but expired', async () => {
-        await setupQuotaLimits('events', [{ token: team.api_token, limitedUntil: Date.now() - 10000 }])
-        expect(await service.isTeamQuotaLimited(team.id, 'events')).toBe(false)
+        service.clearCache('events')
+        service.clearAllCaches()
+        expect(await service.isTeamQuotaLimited(1, 'events')).toBe(false)
+        expect(await service.isTeamTokenQuotaLimited('example-token', 'events')).toBe(false)
+        expect(acquire).not.toHaveBeenCalled()
+        expect(getTeam).not.toHaveBeenCalled()
     })
 })

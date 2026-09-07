@@ -4,10 +4,7 @@
 import os
 from pprint import pprint
 
-from django.conf import settings
 from django.core.management.base import BaseCommand
-
-import posthoganalytics
 
 from posthog.utils import get_helm_info_env, get_machine_id
 
@@ -24,15 +21,3 @@ class Command(BaseCommand):
 
         print(f"Report for {get_machine_id()}:")
         pprint(report)
-
-        if not options["dry_run"]:
-            posthoganalytics.api_key = "sTMFPsFhdP1Ssg"  # ty: ignore[invalid-assignment]
-            disabled = posthoganalytics.disabled
-            posthoganalytics.disabled = False
-            posthoganalytics.capture(
-                distinct_id=get_machine_id(),
-                event="helm_install",
-                properties=report,
-                groups={"instance": settings.SITE_URL},
-            )
-            posthoganalytics.disabled = disabled

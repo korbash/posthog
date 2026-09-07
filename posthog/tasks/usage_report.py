@@ -29,7 +29,7 @@ from posthog import version_requirement
 from posthog.clickhouse.client import sync_execute
 from posthog.clickhouse.client.connection import ClickHouseUser, Workload
 from posthog.clickhouse.query_tagging import Feature, Product, tags_context
-from posthog.cloud_utils import get_cached_instance_license
+from posthog.cloud_utils import get_cached_instance_license, is_posthog_cloud_egress_enabled
 from posthog.constants import FlagRequestType
 from posthog.exceptions_capture import capture_exception
 from posthog.logging.timing import timed_log
@@ -505,13 +505,14 @@ def get_org_user_count(organization_id: str) -> int:
 
 @cached(cache={})
 def get_ph_client(*args: Any, **kwargs: Any) -> PostHogClient:
+    kwargs["disabled"] = bool(kwargs.get("disabled", False) or settings.TEST or not is_posthog_cloud_egress_enabled())
     return PostHogClient("sTMFPsFhdP1Ssg", *args, **kwargs)
 
 
 @shared_task(**USAGE_REPORT_TASK_KWARGS, max_retries=3, rate_limit="5/s")
 @skip_team_scope_audit
 def send_report_to_billing_service(org_id: str, report: dict[str, Any]) -> None:
-    if not settings.EE_AVAILABLE:
+    if not settings.EE_AVAILABLE or not is_posthog_cloud_egress_enabled():
         return
 
     from ee.billing.billing_manager import BillingManager, build_billing_token

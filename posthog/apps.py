@@ -5,18 +5,8 @@ from django.conf import settings
 
 import structlog
 import posthoganalytics
-from asgiref.sync import async_to_sync
-from posthoganalytics.client import Client
 
-from posthog.git import get_git_branch, get_git_commit_short
-from posthog.utils import (
-    _build_flag_provider,
-    get_available_timezones_with_offsets,
-    get_instance_region,
-    get_machine_id,
-    initialize_self_capture_api_token,
-    str_to_bool,
-)
+from posthog.utils import get_available_timezones_with_offsets, get_instance_region, str_to_bool
 
 logger = structlog.get_logger(__name__)
 
@@ -92,53 +82,7 @@ class PostHogConfig(AppConfig):
         else:
             posthoganalytics.capture_exception_code_variables = True  # ty: ignore[invalid-assignment]
 
-        if settings.E2E_TESTING:
-            posthoganalytics.api_key = "phc_ex7Mnvi4DqeB6xSQoXU1UVPzAmUIpiciRKQQXGGTYQO"  # ty: ignore[invalid-assignment]
-            posthoganalytics.personal_api_key = None
-        elif settings.TEST or os.environ.get("OPT_OUT_CAPTURE", False):
-            posthoganalytics.disabled = True  # ty: ignore[invalid-assignment]
-        elif settings.DEBUG:
-            # In dev, analytics is by default turned to self-capture, i.e. data going into this very instance of PostHog
-            # Due to ASGI's workings, we can't query for the right project token in this `ready()` method
-            # Instead, we configure self-capture with `self_capture_wrapper()` in posthog/asgi.py - see that file
-            # Self-capture for WSGI is initialized here
-            posthoganalytics.disabled = True  # ty: ignore[invalid-assignment]
-            logger.info(
-                "posthog_config_ready",
-                settings_debug=settings.DEBUG,
-                server_gateway_interface=settings.SERVER_GATEWAY_INTERFACE,
-            )
-            if settings.SERVER_GATEWAY_INTERFACE == "WSGI":
-                async_to_sync(initialize_self_capture_api_token)()
-
-            # log development server launch to posthog
-            if os.getenv("RUN_MAIN") == "true":
-                # posthog.tasks.__init__ is a celery autoimport aggregator: importing any
-                # submodule loads every task module. Keep that off django.setup() for all
-                # processes; celery workers get it via autodiscover_tasks().
-                from posthog.tasks.tasks import sync_all_organization_available_product_features  # noqa: PLC0415
-
-                # Sync all organization.available_product_features once on launch, in case plans changed
-                sync_all_organization_available_product_features()
-
-                # NOTE: This has to be created as a separate client so that the "capture" call doesn't lock in the properties
-                phcloud_client = Client(posthoganalytics.api_key)
-
-                phcloud_client.capture(
-                    distinct_id=get_machine_id(),
-                    event="development server launched",
-                    properties={"git_rev": get_git_commit_short(), "git_branch": get_git_branch()},
-                )
-        # Use HyperCache to provide flag definitions instead of per-process API polling.
-        # Falls back to the SDK's emergency API fetch (via personal_api_key) only when
-        # the cache is cold. In E2E testing personal_api_key is None, so a cold cache
-        # will result in no flag definitions being loaded — which is acceptable there.
-        if not posthoganalytics.disabled:
-            posthoganalytics.flag_definition_cache_provider = _build_flag_provider()  # ty: ignore[invalid-assignment]
-
-        # load feature flag definitions if not already loaded
-        if not posthoganalytics.disabled and posthoganalytics.feature_flag_definitions() is None:
-            posthoganalytics.load_feature_flags()
+        posthoganalytics.disabled = True  # ty: ignore[invalid-assignment]
 
         from posthog.async_migrations.setup import setup_async_migrations
 

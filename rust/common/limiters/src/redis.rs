@@ -88,6 +88,7 @@ pub struct RedisLimiter {
     key: String,
     interval: Duration,
     service_name: ServiceName,
+    billing_quota_disabled: bool,
 }
 
 impl RedisLimiter {
@@ -109,6 +110,7 @@ impl RedisLimiter {
     ) -> anyhow::Result<RedisLimiter> {
         let limited = Arc::new(DashMap::new());
         let key_prefix = redis_key_prefix.unwrap_or_default();
+        let billing_quota_disabled = limiter_cache_key == QUOTA_LIMITER_CACHE_KEY;
 
         let limiter = RedisLimiter {
             limited,
@@ -116,10 +118,12 @@ impl RedisLimiter {
             key: format!("{key_prefix}{limiter_cache_key}{}", resource.as_str()),
             interval,
             service_name,
+            billing_quota_disabled,
         };
 
-        // Spawn a background task to periodically fetch data from Redis
-        limiter.spawn_background_update();
+        if !billing_quota_disabled {
+            limiter.spawn_background_update();
+        }
 
         Ok(limiter)
     }
@@ -169,6 +173,9 @@ impl RedisLimiter {
     }
 
     pub async fn is_limited(&self, value: &str) -> bool {
+        if self.billing_quota_disabled {
+            return false;
+        }
         self.limited.get(value).is_some()
     }
 }
@@ -204,14 +211,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_custom_key_prefix() {
+    async fn test_billing_quota_limiter_is_disabled_with_custom_prefix() {
         let client = MockRedisClient::new().zrangebyscore_ret(
             "prefix//@posthog/quota-limits/events",
             vec![String::from("banana")],
         );
         let client = Arc::new(client);
 
-        // Default lookup without prefix fails
         let limiter = RedisLimiter::new(
             Duration::from_secs(1),
             client.clone(),
@@ -224,7 +230,6 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         assert!(!limiter.is_limited("banana").await);
 
-        // Limiter using the correct prefix
         let prefixed_limiter = RedisLimiter::new(
             Duration::from_micros(1),
             client,
@@ -237,11 +242,11 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
         assert!(!prefixed_limiter.is_limited("not_limited").await);
-        assert!(prefixed_limiter.is_limited("banana").await);
+        assert!(!prefixed_limiter.is_limited("banana").await);
     }
 
     #[tokio::test]
-    async fn test_feature_flag_limiter() {
+    async fn test_feature_flag_billing_quota_limiter_is_disabled() {
         let client = MockRedisClient::new().zrangebyscore_ret(
             "@posthog/quota-limits/feature_flag_requests",
             vec![String::from("banana")],
@@ -260,6 +265,6 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
         assert!(!limiter.is_limited("not_limited").await);
-        assert!(limiter.is_limited("banana").await);
+        assert!(!limiter.is_limited("banana").await);
     }
 }

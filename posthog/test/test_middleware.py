@@ -1898,21 +1898,12 @@ class TestCSPMiddleware(APIBaseTest):
         assert "Content-Security-Policy-Report-Only" in response
         assert "Content-Security-Policy" not in response
 
-    def test_html_response_declares_default_reporting_endpoint_with_distinct_id(self):
-        # Browsers only deliver crash reports to the endpoint named `default`, so dropping or
-        # renaming it silently stops crash ingestion.
+    @override_settings(CLOUD_DEPLOYMENT="US", DEBUG=False, OPT_OUT_CAPTURE=False, TEST=False)
+    def test_html_always_omits_posthog_cloud_reporting(self):
         response = self.client.get("/")
-        header = response["Reporting-Endpoints"]
-        assert 'posthog="https://us.i.posthog.com/report/' in header
-        assert 'default="https://us.i.posthog.com/report/' in header
-        assert f"distinct_id={self.user.distinct_id}" in header
 
-    def test_reporting_endpoints_omit_distinct_id_when_logged_out(self):
-        self.client.logout()
-        response = self.client.get("/login")
-        header = response["Reporting-Endpoints"]
-        assert 'default="https://us.i.posthog.com/report/' in header
-        assert "distinct_id" not in header
+        assert "Reporting-Endpoints" not in response
+        assert "report-uri https://us.i.posthog.com" not in response["Content-Security-Policy-Report-Only"]
 
 
 class TestSocialAuthExceptionMiddleware(APIBaseTest):

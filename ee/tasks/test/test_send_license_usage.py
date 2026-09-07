@@ -10,6 +10,19 @@ from ee.tasks.send_license_usage import send_license_usage
 
 
 class SendLicenseUsageTest(LicensedTestMixin, ClickhouseDestroyTablesMixin, APIBaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        egress_patch = patch("ee.tasks.send_license_usage.is_posthog_cloud_egress_enabled", return_value=True)
+        egress_patch.start()
+        self.addCleanup(egress_patch.stop)
+
+    @patch("ee.tasks.send_license_usage.requests.post")
+    def test_disabled_egress_is_a_no_op(self, mock_post: Mock) -> None:
+        with patch("ee.tasks.send_license_usage.is_posthog_cloud_egress_enabled", return_value=False):
+            send_license_usage()
+
+        mock_post.assert_not_called()
+
     @freeze_time("2021-10-10T23:01:00Z")
     @patch("posthoganalytics.capture")
     @patch("ee.tasks.send_license_usage.requests.post")

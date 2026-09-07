@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
 from posthog.test.base import APIBaseTest
-from unittest.mock import AsyncMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from django.db import DatabaseError
 from django.test import SimpleTestCase
@@ -53,33 +53,20 @@ class TestProxyRecordAPI(APIBaseTest):
         super().setUpTestData()
         cls.organization_membership.level = OrganizationMembership.Level.ADMIN
         cls.organization_membership.save()
-        cls.organization.available_product_features = [
-            {"key": "managed_reverse_proxy", "name": "managed_reverse_proxy", "limit": 2}
-        ]
-        cls.organization.save()
 
     def setUp(self):
         super().setUp()
         self.organization_membership.refresh_from_db()
         self.organization.refresh_from_db()
 
-    def test_list_returns_max_proxy_records_from_feature(self):
+    def test_list_returns_unlimited_max_proxy_records(self):
         response = self.client.get(f"/api/organizations/{self.organization.id}/proxy_records/")
         assert response.status_code == status.HTTP_200_OK
         data = response.json()
         assert "results" in data
         assert "max_proxy_records" in data
-        assert data["max_proxy_records"] == 2
+        assert data["max_proxy_records"] == 2_147_483_647
         assert data["results"] == []
-
-    def test_list_returns_default_without_feature(self):
-        self.organization.available_product_features = []
-        self.organization.save()
-
-        response = self.client.get(f"/api/organizations/{self.organization.id}/proxy_records/")
-        assert response.status_code == status.HTTP_200_OK
-        data = response.json()
-        assert data["max_proxy_records"] == 2
 
     def test_list_reports_root_redirect_support_for_each_proxy(self) -> None:
         ProxyRecord.objects.bulk_create(
@@ -129,7 +116,7 @@ class TestProxyRecordAPI(APIBaseTest):
 
     @patch("posthog.api.proxy_record.sync_connect")
     @patch("posthoganalytics.capture")
-    def test_cannot_exceed_feature_limit(self, mock_capture, mock_sync_connect):
+    def test_can_exceed_previous_free_tier_limit(self, mock_capture: MagicMock, mock_sync_connect: MagicMock) -> None:
         mock_temporal = AsyncMock()
         mock_sync_connect.return_value = mock_temporal
 
@@ -145,8 +132,8 @@ class TestProxyRecordAPI(APIBaseTest):
             f"/api/organizations/{self.organization.id}/proxy_records/",
             {"domain": "proxy2.example.com"},
         )
-        assert response.status_code == status.HTTP_400_BAD_REQUEST
-        assert "Maximum of 2 proxy records" in response.json()["detail"]
+        assert response.status_code == status.HTTP_201_CREATED
+        assert ProxyRecord.objects.filter(organization=self.organization).count() == 3
 
     @patch("posthog.api.proxy_record.sync_connect")
     @patch("posthoganalytics.capture")

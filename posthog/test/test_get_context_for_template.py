@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 from django.contrib.auth.models import AnonymousUser
 from django.contrib.sessions.middleware import SessionMiddleware
 from django.http import HttpResponse
-from django.test import RequestFactory
+from django.test import RequestFactory, override_settings
 
 from parameterized import parameterized
 
@@ -23,21 +23,16 @@ class TestGetContextForTemplate(APIBaseTest):
                 MagicMock(),
             )
 
-        # Under self-capture, posthog-js evaluates PostHog's own flags with the dogfood-flags team's
-        # token (first team by PK), which in this test is self.team — not the PH Cloud key.
-        assert self.team.api_token != "sTMFPsFhdP1Ssg"
         assert actual == {
             "git_rev": mock.ANY,
             "js_capture_time_to_see_data": False,
-            "js_posthog_api_key": self.team.api_token,
-            "js_posthog_host": "",
             "js_url": "http://localhost:8234",
-            "opt_out_capture": False,
+            "opt_out_capture": True,
             "posthog_app_context": '{"persisted_feature_flags": ["the_persisted_flags"], "anonymous": false}',
             "posthog_bootstrap": "{}",
             "posthog_js_uuid_version": "v7",
             "region": None,
-            "self_capture": True,
+            "self_capture": False,
         }
 
     def test_picks_up_stripe_public_key_from_environment(self):
@@ -48,6 +43,15 @@ class TestGetContextForTemplate(APIBaseTest):
             )
 
         assert actual["stripe_public_key"] == "pk_test_12345"
+
+    @override_settings(CLOUD_DEPLOYMENT="E2E", DEBUG=False, E2E_TESTING=True, OPT_OUT_CAPTURE=False, TEST=False)
+    def test_e2e_context_omits_posthog_cloud_credentials(self):
+        actual = get_context_for_template("layout", MagicMock())
+
+        assert actual["opt_out_capture"] is True
+        assert actual["e2e_testing"] is True
+        assert "js_posthog_api_key" not in actual
+        assert "js_posthog_host" not in actual
 
     @parameterized.expand(
         [

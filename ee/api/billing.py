@@ -7,12 +7,11 @@ from django.http import HttpResponse
 from django.shortcuts import redirect
 from django.utils import timezone
 
-import requests
 import structlog
 import posthoganalytics
 from drf_spectacular.utils import OpenApiResponse, extend_schema, extend_schema_serializer
 from rest_framework import permissions, serializers, status, viewsets
-from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.request import Request
 from rest_framework.response import Response
 
@@ -35,8 +34,6 @@ from products.access_control.backend.facade.user_access_control import UserAcces
 
 from ee.billing.billing_manager import BillingManager
 from ee.billing.billing_types import USAGE_TYPE_VALUES
-from ee.models import License
-from ee.settings import BILLING_SERVICE_URL
 
 logger = structlog.get_logger(__name__)
 
@@ -417,19 +414,10 @@ class BillingViewset(TeamAndOrgViewSetMixin, viewsets.GenericViewSet):
 
     @extend_schema(responses={200: OpenApiResponse(response=BillingOverviewResponseSerializer)})
     def list(self, request: Request, *args: Any, **kwargs: Any) -> Response:
-        license = get_cached_instance_license()
-        if license and not license.is_v2_license:
-            raise NotFound("Billing is not supported for this license type")
-
         org = self._get_org()
         if is_token_auth_request(request):
             if not org or not isinstance(request.user, User) or not user_has_billing_access(request.user, org):
                 raise PermissionDenied("You do not have access to Billing for this organization.")
-
-        # If on Cloud and we have the property billing - return 404 as we always use legacy billing it it exists
-        if hasattr(org, "billing"):
-            if org.billing.stripe_subscription_id:  # type: ignore
-                raise NotFound("Billing V1 is active for this organization")
 
         billing_manager = self.get_billing_manager()
         query = {}
@@ -597,13 +585,6 @@ class BillingViewset(TeamAndOrgViewSetMixin, viewsets.GenericViewSet):
         permission_classes=[permissions.IsAuthenticated, HasBillingAccess],
     )
     def portal(self, request: Request, *args: Any, **kwargs: Any) -> HttpResponse:
-        license = get_cached_instance_license()
-        if not license:
-            return Response(
-                {"success": True},
-                status=status.HTTP_200_OK,
-            )
-
         organization = self._get_org_required()
 
         billing_manager = self.get_billing_manager()
@@ -612,13 +593,6 @@ class BillingViewset(TeamAndOrgViewSetMixin, viewsets.GenericViewSet):
 
     @action(methods=["GET"], detail=False)
     def get_invoices(self, request: Request, *args: Any, **kwargs: Any) -> HttpResponse:
-        license = get_cached_instance_license()
-        if not license:
-            return Response(
-                {"success": True},
-                status=status.HTTP_200_OK,
-            )
-
         organization = self._get_org_required()
 
         invoice_status = request.GET.get("status")
@@ -652,13 +626,6 @@ class BillingViewset(TeamAndOrgViewSetMixin, viewsets.GenericViewSet):
 
     @action(methods=["GET"], detail=False, url_path="credits/overview")
     def credits_overview(self, request: Request, *args: Any, **kwargs: Any) -> HttpResponse:
-        license = get_cached_instance_license()
-        if not license:
-            return Response(
-                {"success": True},
-                status=status.HTTP_200_OK,
-            )
-
         organization = self._get_org_required()
 
         billing_manager = self.get_billing_manager()
@@ -672,13 +639,6 @@ class BillingViewset(TeamAndOrgViewSetMixin, viewsets.GenericViewSet):
         permission_classes=[permissions.IsAuthenticated, HasBillingAccess],
     )
     def purchase_credits(self, request: Request, *args: Any, **kwargs: Any) -> HttpResponse:
-        license = get_cached_instance_license()
-        if not license:
-            return Response(
-                {"success": True},
-                status=status.HTTP_200_OK,
-            )
-
         organization = self._get_org_required()
 
         billing_manager = self.get_billing_manager()
@@ -697,6 +657,7 @@ class BillingViewset(TeamAndOrgViewSetMixin, viewsets.GenericViewSet):
         res = billing_manager.activate_trial(organization, request.data)
         return Response(res, status=status.HTTP_200_OK)
 
+    @extend_schema(request=BillingSerializer, responses={200: None})
     @action(
         methods=["POST"],
         detail=False,
@@ -706,18 +667,11 @@ class BillingViewset(TeamAndOrgViewSetMixin, viewsets.GenericViewSet):
     def cancel_trial(self, request: Request, *args: Any, **kwargs: Any) -> HttpResponse:
         organization = self._get_org_required()
         billing_manager = self.get_billing_manager()
-        res = billing_manager.cancel_trial(organization, request.data)
-        return Response(res, status=status.HTTP_200_OK)
+        billing_manager.cancel_trial(organization, request.data)
+        return Response(status=status.HTTP_200_OK)
 
     @action(methods=["POST"], detail=False, url_path="activate/authorize")
     def authorize(self, request: Request, *args: Any, **kwargs: Any) -> HttpResponse:
-        license = get_cached_instance_license()
-        if not license:
-            return Response(
-                {"success": True},
-                status=status.HTTP_200_OK,
-            )
-
         organization = self._get_org_required()
         billing_manager = self.get_billing_manager()
         res = billing_manager.authorize(organization)
@@ -725,13 +679,6 @@ class BillingViewset(TeamAndOrgViewSetMixin, viewsets.GenericViewSet):
 
     @action(methods=["POST"], detail=False, url_path="activate/authorize/status")
     def authorize_status(self, request: Request, *args: Any, **kwargs: Any) -> HttpResponse:
-        license = get_cached_instance_license()
-        if not license:
-            return Response(
-                {"success": True},
-                status=status.HTTP_200_OK,
-            )
-
         organization = self._get_org_required()
         billing_manager = self.get_billing_manager()
         res = billing_manager.authorize_status(organization, request.data)
@@ -743,34 +690,9 @@ class BillingViewset(TeamAndOrgViewSetMixin, viewsets.GenericViewSet):
         permission_classes=[permissions.IsAuthenticated, HasBillingAccess],
     )
     def license(self, request: Request, *args: Any, **kwargs: Any) -> HttpResponse:
-        license = get_cached_instance_license()
-
-        if license:
-            raise PermissionDenied(
-                "A valid license key already exists. This must be removed before a new one can be added."
-            )
-
-        organization = self._get_org_required()
-
+        self._get_org_required()
         serializer = LicenseKeySerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        license = License(key=serializer.validated_data["license"])
-        ip_address = get_trusted_client_ip(request)
-        res = requests.get(
-            f"{BILLING_SERVICE_URL}/api/billing",
-            headers=BillingManager(license, ip_address=ip_address).get_auth_headers(organization),
-        )
-
-        if res.status_code != 200:
-            raise ValidationError(
-                {
-                    "license": f"License could not be activated. Please contact support. (BillingService status {res.status_code})",
-                }
-            )
-        data = res.json()
-        BillingManager(license, ip_address=ip_address).update_license_details(data)
+        serializer.is_valid(raise_exception=True)
         return Response({"success": True})
 
     @action(

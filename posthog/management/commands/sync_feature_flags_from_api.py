@@ -5,6 +5,7 @@ from django.core.management.base import BaseCommand
 
 import requests
 
+from posthog.cloud_utils import is_posthog_cloud_egress_enabled
 from posthog.models import Project, User
 from posthog.ph_client import PH_US_API_KEY
 
@@ -35,6 +36,9 @@ def sync_feature_flags_from_api(
         groups: Optional dict of group types to IDs (customer, instance, organization, project)
         output_fn: Function to call for output (defaults to print, can use self.stdout.write for management commands)
     """
+    if not is_posthog_cloud_egress_enabled():
+        return
+
     if groups is None:
         groups = {
             "customer": "cus_IK2DWsWVn2ZM16",

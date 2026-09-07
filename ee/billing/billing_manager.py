@@ -1,17 +1,12 @@
 import hmac
-import json
 import time
 import hashlib
 from datetime import UTC, datetime, timedelta
 from enum import Enum, StrEnum
 from typing import Any, Literal, Optional, cast
-from uuid import UUID
 
 from django.conf import settings
-from django.core.cache import cache
-from django.db.models import F
 from django.utils import timezone
-from django.utils.dateparse import parse_datetime
 
 import jwt
 import requests
@@ -19,34 +14,20 @@ import structlog
 from requests import JSONDecodeError
 from rest_framework.exceptions import NotAuthenticated
 
-from posthog.cloud_utils import get_cached_instance_license
 from posthog.dataclasses import frozen
 from posthog.event_usage import report_user_action
-from posthog.exceptions_capture import capture_exception
 from posthog.models import Organization
-from posthog.models.organization import OrganizationMembership, OrganizationUsageInfo
-from posthog.models.team.event_retention import (
-    organization_events_retention_months,
-    reconcile_organization_events_retention,
-)
-from posthog.models.team.logs_retention import reset_revoked_logs_retention
+from posthog.models.organization import OrganizationMembership, ProductFeature
 from posthog.models.user import User
 
-from ee.billing.billing_types import BillingProvider, BillingStatus, CustomerInfo
-from ee.billing.quota_limiting import set_org_usage_summary, update_org_billing_quotas
+from ee.billing.billing_types import BillingProvider, BillingStatus
 from ee.models import License
-from ee.settings import BILLING_SERVICE_URL
 
 logger = structlog.get_logger(__name__)
 
 BILLING_PROVIDER_WEBHOOK_SIGNATURE_HEADER = "X-PostHog-Billing-Provider-Signature"
 BILLING_PROVIDER_WEBHOOK_TIMESTAMP_HEADER = "X-PostHog-Billing-Provider-Timestamp"
 BILLING_PROVIDER_WEBHOOK_SIGNATURE_VERSION = "sha256"
-BILLING_TIMESERIES_REQUEST_TIMEOUT = (5, 30)
-
-# Marks tokens minted by the billing alerts evaluation job; billing recognizes this claim
-# on its read-only billing status path for tokens without a user role.
-BILLING_ALERTS_EVALUATION_SERVICE_ACTION = "billing_alerts_evaluation"
 
 
 StartupProgramLabel = Literal["Startup", "YC"]
@@ -64,9 +45,6 @@ class FundingStatusUnavailable(Exception):
     pass
 
 
-_FUNDING_STATUS_UNAVAILABLE_CACHE_VALUE = "__funding_status_unavailable__"
-
-
 @frozen
 class OrganizationFundingStatus:
     startup_program_label: StartupProgramLabel | None
@@ -81,32 +59,6 @@ class BillingServiceOpenInvoicesError(Exception):
     def __init__(self, message: str):
         self.message = message
         super().__init__(message)
-
-
-def _has_quota_limiting_markers(usage: dict | None) -> bool:
-    if not usage:
-        return False
-
-    for value in usage.values():
-        if isinstance(value, dict) and (
-            value.get("quota_limited_until") is not None or value.get("quota_limiting_suspended_until") is not None
-        ):
-            return True
-
-    return False
-
-
-def _free_trial_active(customer: CustomerInfo) -> bool:
-    free_trial_until = customer.get("free_trial_until")
-    if not free_trial_until:
-        return False
-    expires = parse_datetime(free_trial_until) if isinstance(free_trial_until, str) else free_trial_until
-    if expires is None:
-        return False
-    # An offset-less timestamp parses naive, and comparing naive to aware raises TypeError.
-    if timezone.is_naive(expires):
-        expires = expires.replace(tzinfo=UTC)
-    return expires > timezone.now()
 
 
 def _get_user_organization_role(user: User, organization: Organization) -> Optional[str]:
@@ -252,12 +204,10 @@ def _parse_funding_status(data: object) -> OrganizationFundingStatus:
 
 
 class BillingManager:
-    license: License | None
-    user: User | None
-    ip_address: str | None
+    """Local billing compatibility API; no operation contacts a billing provider."""
 
-    def __init__(self, license, user: User | None = None, ip_address: str | None = None):
-        self.license = license or get_cached_instance_license()
+    def __init__(self, license: License | None, user: User | None = None, ip_address: str | None = None) -> None:
+        self.license = license
         self.user = user
         self.ip_address = ip_address
 
@@ -266,439 +216,77 @@ class BillingManager:
         organization: Organization | None,
         query_params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if not organization or not self.license or not self.license.is_v2_license:
-            return self._get_default_billing_response(organization)
-
-        # Get billing info from billing service
-        billing_service_response = self._get_billing(organization, query_params)
-
-        customer = cast(dict[str, Any], billing_service_response).get("customer")
-        if not customer:
-            return self._get_default_billing_response(organization)
-
-        # Ensure the license and org are updated with the latest info
-        if billing_service_response.get("license"):
-            self.update_license_details(billing_service_response)
-
-        if organization and billing_service_response:
-            self.update_org_details(organization, billing_service_response)
-
-        response: dict[str, Any] = {"available_product_features": []}
-
-        response["license"] = {"plan": self.license.plan}
-
-        response.update(billing_service_response["customer"])
-
-        if not billing_service_response["customer"].get("products"):
-            products = self.get_default_products(organization)
-            response["products"] = products["products"]
-
-        response["stripe_portal_url"] = f"{settings.SITE_URL}/api/billing/portal"
-
-        usage_summary = response.get("usage_summary") or {}
-        if organization.usage:
-            for usage_key, usage in usage_summary.items():
-                # both dicts carry non-usage entries, e.g. "period" is a list
-                org_usage = organization.usage.get(usage_key)
-                if not isinstance(org_usage, dict) or not isinstance(usage, dict):
-                    continue
-                todays_usage = org_usage.get("todays_usage")
-                if todays_usage is not None:
-                    usage["todays_usage"] = todays_usage
-
-        # Extend the products with accurate usage_limit info
-        for product in response["products"]:
-            usage_key = product.get("usage_key")
-            if not usage_key:
-                continue
-            usage = response.get("usage_summary", {}).get(usage_key, {})
-            usage_limit = usage.get("limit")
-            billing_reported_usage = usage.get("usage") or 0
-            current_usage = billing_reported_usage
-
-            if usage.get("todays_usage"):
-                todays_usage = usage["todays_usage"]
-                current_usage = billing_reported_usage + todays_usage
-
-            product["current_usage"] = current_usage
-            product["percentage_usage"] = current_usage / usage_limit if usage_limit else 0
-
-        return response
+        return self._get_default_billing_response(organization)
 
     def update_billing(
         self, organization: Organization, data: dict[str, Any], authorizer_actor: Optional[User] = None
     ) -> None:
-        res = requests.patch(
-            f"{BILLING_SERVICE_URL}/api/billing/",
-            headers=self.get_auth_headers(organization, authorizer_actor=authorizer_actor),
-            json=data,
-        )
+        return None
 
-        handle_billing_service_error(res)
-
-    def update_available_product_features(self, organization: Organization) -> list[dict[str, Any]]:
-        res = requests.get(
-            f"{BILLING_SERVICE_URL}/api/billing/available_product_features",
-            headers=self.get_auth_headers(organization),
-        )
-
-        handle_billing_service_error(res)
-
-        available_product_features_json = res.json()
-        available_product_features = available_product_features_json.get("available_product_features", [])
-        previous_feature_keys = {
-            feature.get("key") for feature in (organization.available_product_features or []) if feature
-        }
-        previous_retention_months = organization_events_retention_months(organization)
-        organization.available_product_features = available_product_features
-        organization.save()
-
-        if (
-            available_product_features
-            and organization_events_retention_months(organization) != previous_retention_months
-        ):
-            reconcile_organization_events_retention(organization)
-
-        # Only reset on a non-empty list: the retention reset is not self-healing, so an
-        # empty error-path response must not permanently downgrade team settings.
-        if available_product_features:
-            revoked_feature_keys = previous_feature_keys - {
-                feature.get("key") for feature in available_product_features if feature
-            }
-            if revoked_feature_keys:
-                reset_revoked_logs_retention(organization, revoked_feature_keys)
-
-        return available_product_features
+    def update_available_product_features(self, organization: Organization) -> list[ProductFeature]:
+        return organization.update_available_product_features(save=True)
 
     def update_billing_organization_users(self, organization: Organization) -> None:
-        """
-        Updates the register of users in the Billing service.
-        Since this can be called with users that are not ADMINs and update_billing requires
-        an ADMIN role, we do a privilege escalation using the owner.
-        """
-        try:
-            distinct_ids = list(organization.members.values_list("distinct_id", flat=True))
-
-            first_owner_membership = (
-                OrganizationMembership.objects.filter(organization=organization, level=15)
-                .order_by("-joined_at")
-                .first()
-            )
-            if not first_owner_membership:
-                capture_exception(
-                    Exception(f"No owner membership found for organization"),
-                    {"organization_id": organization.id},
-                )
-                return
-            first_owner = first_owner_membership.user
-
-            admin_emails = list(
-                organization.members.filter(
-                    organization_membership__level__gte=OrganizationMembership.Level.ADMIN
-                ).values_list("email", flat=True)
-            )
-
-            org_users = list(
-                organization.members.values("email", "distinct_id", "organization_membership__level")
-                .order_by("email")  # Deterministic order for tests
-                .annotate(role=F("organization_membership__level"))
-                .filter(role__gte=OrganizationMembership.Level.ADMIN)
-                .values(
-                    "email",
-                    "distinct_id",
-                    "role",
-                )
-            )
-
-            self.update_billing(
-                organization,
-                {
-                    "distinct_ids": distinct_ids,
-                    "org_customer_email": first_owner.email,
-                    "org_admin_emails": admin_emails,
-                    "org_users": org_users,
-                },
-                authorizer_actor=first_owner,
-            )
-        except Exception as e:
-            capture_exception(e, {"organization_id": organization.id})
+        return None
 
     def activate_subscription(self, organization: Organization, data: dict[str, Any]) -> dict[str, Any]:
-        res = requests.post(
-            f"{BILLING_SERVICE_URL}/api/activate",
-            headers=self.get_auth_headers(organization),
-            json=data,
-        )
-
-        handle_billing_service_error(res)
-
-        return res.json()
+        return {"success": True}
 
     def deactivate_products(self, organization: Organization, products: str) -> None:
-        res = requests.post(
-            f"{BILLING_SERVICE_URL}/api/billing/deactivate",
-            headers=self.get_auth_headers(organization),
-            json={"products": products},
-        )
-
-        handle_billing_service_error(res)
+        return None
 
     def get_funding_status(self, organization: Organization) -> OrganizationFundingStatus:
-        cache_key = f"organization_funding_status:{organization.id}"
-        try:
-            cached_status = cache.get(cache_key)
-        except Exception:
-            logger.warning("funding_status_cache_read_failed", exc_info=True)
-            cached_status = None
-
-        if cached_status == _FUNDING_STATUS_UNAVAILABLE_CACHE_VALUE:
-            raise FundingStatusUnavailable("Could not resolve organization funding status")
-        if cached_status is not None:
-            return _parse_funding_status(cached_status)
-
-        try:
-            response = requests.get(
-                f"{BILLING_SERVICE_URL}/api/billing/funding-status/",
-                headers=self.get_auth_headers(organization),
-                timeout=5,
-            )
-            handle_billing_service_error(response, valid_codes=(200,))
-            raw_status = response.json()
-            funding_status = _parse_funding_status(raw_status)
-        except Exception as error:
-            try:
-                cache.set(cache_key, _FUNDING_STATUS_UNAVAILABLE_CACHE_VALUE, timeout=5)
-            except Exception:
-                logger.warning("funding_status_failure_cache_write_failed", exc_info=True)
-            if isinstance(error, FundingStatusUnavailable):
-                raise
-            raise FundingStatusUnavailable("Could not resolve organization funding status") from error
-
-        try:
-            cache.set(cache_key, raw_status, timeout=30)
-        except Exception:
-            logger.warning("funding_status_cache_write_failed", exc_info=True)
-
-        return funding_status
+        return OrganizationFundingStatus(startup_program_label=None, prepaid_credit_state=PrepaidCreditState.NONE)
 
     def _get_default_billing_response(self, organization: Organization | None) -> dict[str, Any]:
-        products = self.get_default_products(organization)
-        response = {
-            "available_product_features": [],
-            "products": products["products"],
+        return {
+            **self._get_billing(organization)["customer"],
+            "stripe_portal_url": self._get_stripe_portal_url(organization),
         }
 
-        return response
+    def get_default_products(self, organization: Organization | None) -> dict[str, Any]:
+        return {"products": self._get_products(organization)}
 
-    def get_default_products(self, organization: Organization | None) -> dict:
-        response = {}
-        # If we don't have products from the billing service then get the default ones with our local usage calculation
-        products = self._get_products(organization)
-        response["products"] = products
-
-        return response
-
-    def update_license_details(self, billing_status: BillingStatus) -> License:
-        """
-        Ensure the license details are up-to-date locally
-        """
-        if not self.license:  # mypy
-            raise Exception("No license found")
-
-        license_modified = False
-
-        data = billing_status["license"]
-
-        if not self.license.valid_until or self.license.valid_until < datetime.now(UTC) + timedelta(days=29):
-            # NOTE: License validity is a legacy concept. For now we always extend the license validity by 30 days.
-            self.license.valid_until = datetime.now(UTC) + timedelta(days=30)
-            license_modified = True
-
-        if self.license.plan != data["type"]:
-            self.license.plan = data["type"]
-            license_modified = True
-
-        if license_modified:
-            self.license.save()
-
+    def update_license_details(self, billing_status: BillingStatus) -> License | None:
         return self.license
 
-    def _get_billing(self, organization: Organization, query_params: dict[str, Any] | None = None) -> BillingStatus:
-        """
-        Retrieves billing info and updates local models if necessary
-        """
-        if not self.license:  # mypy
-            raise Exception("No license found")
+    def _get_billing(
+        self, organization: Organization | None, query_params: dict[str, Any] | None = None
+    ) -> BillingStatus:
+        period_start = timezone.now().astimezone(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        period_end = (period_start + timedelta(days=32)).replace(day=1)
+        return {
+            "license": {"type": "self-hosted"},
+            "customer": {
+                "customer_id": organization.customer_id if organization else None,
+                "deactivated": False,
+                "has_active_subscription": False,
+                "billing_period": {
+                    "current_period_start": period_start.isoformat(),
+                    "current_period_end": period_end.isoformat(),
+                    "interval": "month",
+                },
+                "available_product_features": (organization.available_product_features or []) if organization else [],
+                "current_total_amount_usd": "0",
+                "current_total_amount_usd_after_discount": "0",
+                "projected_total_amount_usd_with_limit_after_discount": "0",
+                "products": [],
+                "custom_limits_usd": {},
+                "usage_summary": {},
+                "free_trial_until": None,
+                "discount_percent": None,
+                "discount_amount_usd": None,
+                "customer_trust_scores": {},
+            },
+        }
 
-        res = requests.get(
-            f"{BILLING_SERVICE_URL}/api/billing",
-            headers=self.get_auth_headers(organization),
-            params=query_params,
-        )
-        handle_billing_service_error(res)
+    def _get_stripe_portal_url(self, organization: Organization | None) -> str:
+        return "/organization/billing"
 
-        data = res.json()
-
-        return data
-
-    def _get_stripe_portal_url(self, organization: Organization) -> str:
-        """
-        Retrieves stripe protal url
-        """
-        if not self.license:  # mypy
-            raise Exception("No license found")
-
-        res = requests.get(
-            f"{BILLING_SERVICE_URL}/api/billing/portal",
-            headers=self.get_auth_headers(organization),
-        )
-
-        handle_billing_service_error(res)
-
-        data = res.json()
-
-        return data["url"]
-
-    def _get_products(self, organization: Organization | None):
-        headers = {}
-        params = {"plan": "standard"}
-
-        if self.license and organization:
-            headers = self.get_auth_headers(organization)
-
-        res = requests.get(
-            f"{BILLING_SERVICE_URL}/api/products-v2",
-            params=params,
-            headers=headers,
-        )
-
-        handle_billing_service_error(res)
-
-        return res.json().get("products", [])
+    def _get_products(self, organization: Organization | None) -> list[dict[str, Any]]:
+        return []
 
     def update_org_details(self, organization: Organization, billing_status: BillingStatus) -> Organization:
-        """
-        Ensure the relevant organization details are up-to-date locally
-        """
-        org_modified = False
-
-        data = billing_status["customer"]
-
-        if data.get("customer_id") and organization.customer_id != data["customer_id"]:
-            organization.customer_id = data["customer_id"]
-            org_modified = True
-
-        should_update_org_billing_quotas = False
-
-        usage_summary = cast(dict, data.get("usage_summary"))
-        if usage_summary:
-            usage_info = OrganizationUsageInfo(
-                events=usage_summary["events"],
-                exceptions=usage_summary.get("exceptions", {}),
-                recordings=usage_summary["recordings"],
-                survey_responses=usage_summary.get("survey_responses", {}),
-                rows_synced=usage_summary.get("rows_synced", {}),
-                cdp_trigger_events=usage_summary.get("cdp_trigger_events", {}),
-                rows_exported=usage_summary.get("rows_exported", {}),
-                feature_flag_requests=usage_summary.get("feature_flag_requests", {}),
-                api_queries_read_bytes=usage_summary.get("api_queries_read_bytes", {}),
-                llm_events=usage_summary.get("llm_events", {}),
-                ai_credits=usage_summary.get("ai_credits", {}),
-                signals_credits=usage_summary.get("signals_credits", {}),
-                posthog_code_credits=usage_summary.get("posthog_code_credits", {}),
-                posthog_code_token_credits=usage_summary.get("posthog_code_token_credits", {}),
-                sandbox_compute_credits=usage_summary.get("sandbox_compute_credits", {}),
-                sandbox_compute_cpu_millicore_seconds=usage_summary.get("sandbox_compute_cpu_millicore_seconds", {}),
-                sandbox_compute_memory_mib_seconds=usage_summary.get("sandbox_compute_memory_mib_seconds", {}),
-                workflow_emails=usage_summary.get("workflow_emails", {}),
-                workflow_push=usage_summary.get("workflow_push", {}),
-                workflow_destinations_dispatched=usage_summary.get("workflow_destinations_dispatched", {}),
-                logs_mb_ingested=usage_summary.get("logs_mb_ingested", {}),
-                replay_vision_credits=usage_summary.get("replay_vision_credits", {}),
-                period=[
-                    data["billing_period"]["current_period_start"],
-                    data["billing_period"]["current_period_end"],
-                ],
-            )
-
-            had_quota_limiting_markers = _has_quota_limiting_markers(organization.usage)
-            usage_changed = set_org_usage_summary(organization, new_usage=usage_info)
-
-            if usage_changed:
-                org_modified = True
-
-            should_update_org_billing_quotas = usage_changed or had_quota_limiting_markers
-
-        available_product_features = data.get("available_product_features", None)
-        revoked_feature_keys: set[str] = set()
-        events_retention_changed = False
-        # An empty list is deliberately ignored: this runs on hot paths (get_billing, usage
-        # reports) and a partial or error-path billing response must not downgrade the org.
-        # Genuine cancellations still send the (non-empty) free-tier feature list.
-        if available_product_features and available_product_features != organization.available_product_features:
-            previous_feature_keys = {
-                feature.get("key") for feature in (organization.available_product_features or []) if feature
-            }
-            new_feature_keys = {feature.get("key") for feature in available_product_features if feature}
-            revoked_feature_keys = previous_feature_keys - new_feature_keys
-            previous_retention_months = organization_events_retention_months(organization)
-            organization.available_product_features = data["available_product_features"]
-            events_retention_changed = organization_events_retention_months(organization) != previous_retention_months
-            org_modified = True
-
-        never_drop_data = cast(bool | None, data.get("never_drop_data"))
-        if never_drop_data != organization.never_drop_data:
-            organization.never_drop_data = never_drop_data
-            org_modified = True
-
-        # A missing key (partial or error-path response) must not reset a known value to unknown.
-        if "has_active_subscription" in data:
-            has_active_subscription = data.get("has_active_subscription")
-            # Trials run without a Stripe subscription, so a trialing org would otherwise read
-            # as free tier and get metered; count an active trial as paid until it expires.
-            if has_active_subscription is False and _free_trial_active(data):
-                has_active_subscription = True
-            if has_active_subscription != organization.has_active_subscription:
-                organization.has_active_subscription = has_active_subscription
-                org_modified = True
-
-        customer_trust_scores = data.get("customer_trust_scores", {})
-
-        if customer_trust_scores:
-            product_key_to_usage_key = {
-                product["type"]: product["usage_key"]
-                for product in (
-                    billing_status["customer"].get("products") or self.get_default_products(organization)["products"]
-                )
-            }
-            org_customer_trust_scores = {}
-            for product_key in customer_trust_scores:
-                if product_key in product_key_to_usage_key:
-                    org_customer_trust_scores[product_key_to_usage_key[product_key]] = customer_trust_scores[
-                        product_key
-                    ]
-
-            current_customer_trust_scores = organization.customer_trust_scores or {}
-            updated_customer_trust_scores = {
-                **current_customer_trust_scores,
-                **org_customer_trust_scores,
-            }
-            if updated_customer_trust_scores != current_customer_trust_scores:
-                organization.customer_trust_scores = updated_customer_trust_scores
-                org_modified = True
-
-        if org_modified:
-            organization.save()
-
-        if events_retention_changed:
-            reconcile_organization_events_retention(organization)
-
-        if revoked_feature_keys:
-            reset_revoked_logs_retention(organization, revoked_feature_keys)
-
-        if should_update_org_billing_quotas:
-            update_org_billing_quotas(organization)
-
         return organization
 
     def get_auth_headers(
@@ -707,10 +295,10 @@ class BillingManager:
         billing_provider: BillingProvider | None = None,
         authorizer_actor: User | None = None,
         service_action: str | None = None,
-    ):
-        if not self.license:  # mypy
-            raise Exception("No license found")
-        billing_service_token = build_billing_token(
+    ) -> dict[str, str]:
+        if not self.license:
+            raise NotAuthenticated("No license found")
+        token = build_billing_token(
             self.license,
             organization,
             self.user,
@@ -718,311 +306,73 @@ class BillingManager:
             billing_provider=billing_provider,
             service_action=service_action,
         )
-        headers = {"Authorization": f"Bearer {billing_service_token}"}
+        headers = {"Authorization": f"Bearer {token}"}
         if self.ip_address:
-            # Billing is called server-to-server, so it only ever sees PostHog's egress IP.
-            # Forward the end-user's IP so billing can attach it to activity-log records.
             headers["X-PostHog-Actor-IP"] = self.ip_address
         return headers
 
-    def get_invoices(self, organization: Organization, status: str | None):
-        res = requests.get(
-            # TODO(@zach): update this to /api/invoices
-            f"{BILLING_SERVICE_URL}/api/billing/get_invoices",
-            params={"status": status},
-            headers=self.get_auth_headers(organization),
-        )
+    def get_invoices(self, organization: Organization, status: str | None = None) -> dict[str, Any]:
+        return {"count": 0, "results": [], "portal_url": self._get_stripe_portal_url(organization)}
 
-        handle_billing_service_error(res)
+    def credits_overview(self, organization: Organization) -> dict[str, Any]:
+        return {
+            "eligible": False,
+            "estimated_monthly_credit_amount_usd": None,
+            "status": "none",
+            "invoice_url": None,
+            "collection_method": None,
+            "cc_last_four": None,
+            "email": None,
+            "credit_brackets": [],
+        }
 
-        data = res.json()
-
-        return data
-
-    def credits_overview(self, organization: Organization):
-        res = requests.get(
-            f"{BILLING_SERVICE_URL}/api/credits/overview",
-            headers=self.get_auth_headers(organization),
-        )
-
-        handle_billing_service_error(res)
-
-        return res.json()
-
-    def purchase_credits(self, organization: Organization, data: dict[str, Any]):
-        res = requests.post(
-            f"{BILLING_SERVICE_URL}/api/credits/purchase",
-            headers=self.get_auth_headers(organization),
-            json=data,
-        )
-
-        handle_billing_service_error(res)
-
-        return res.json()
+    def purchase_credits(self, organization: Organization, data: dict[str, Any]) -> dict[str, Any]:
+        return {"success": True}
 
     def dispute_signals_pr(self, organization: Organization, data: dict[str, Any]) -> dict[str, Any]:
-        """Ask billing to credit back a refunded Signals PR (idempotent on data['refund_id']).
+        return {"success": True, "credit_amount_usd": "0", "zero_reason": "self_hosted"}
 
-        Billing returns 200 for every handled business outcome, including $0 credits; any other
-        status means "not handled" and must raise so the caller retries. The default valid_codes
-        would swallow 404 (endpoint not deployed) and 401 (auth failure) as success and record an
-        error body as a synced credit, hence the explicit (200,).
-        """
-        res = requests.post(
-            f"{BILLING_SERVICE_URL}/api/signals/dispute-pr",
-            # The service_action claim is required by billing: it distinguishes this
-            # backend-minted token from ones minted for user-initiated billing calls,
-            # which cannot reach the dispute endpoint.
-            headers=self.get_auth_headers(organization, service_action="signals_pr_dispute"),
-            json=data,
-            timeout=30,
-        )
+    def activate_trial(self, organization: Organization, data: dict[str, Any]) -> dict[str, Any]:
+        return {"success": True}
 
-        handle_billing_service_error(res, valid_codes=(200,))
+    def cancel_trial(self, organization: Organization, data: dict[str, Any]) -> None:
+        return None
 
-        return res.json()
+    def authorize(self, organization: Organization, billing_provider: BillingProvider | None = None) -> dict[str, Any]:
+        return {"success": True, "status": "success", "clientSecret": None}
 
-    def activate_trial(self, organization: Organization, data: dict[str, Any]):
-        res = requests.post(
-            f"{BILLING_SERVICE_URL}/api/trials/activate",
-            headers=self.get_auth_headers(organization),
-            json=data,
-        )
-
-        handle_billing_service_error(res)
-
-        self.update_available_product_features(organization)
-
-        return res.json()
-
-    def cancel_trial(self, organization: Organization, data: dict[str, Any]):
-        res = requests.post(
-            f"{BILLING_SERVICE_URL}/api/trials/cancel",
-            headers=self.get_auth_headers(organization),
-            json=data,
-        )
-
-        handle_billing_service_error(res)
-
-        self.update_available_product_features(organization)
-
-    def authorize(self, organization: Organization, billing_provider: BillingProvider | None = None):
-        """
-        Authorize billing for an organization, optionally through a marketplace provider.
-
-        Args:
-            organization: The organization to authorize billing for
-            billing_provider: Optional marketplace provider (e.g., "vercel"). If provided, the organization
-                            must have a corresponding integration configured.
-
-        Raises:
-            ValueError: If billing_provider is specified but the organization doesn't have the integration
-        """
-        # Validate that organization has the integration if billing_provider is specified
-        if billing_provider:
-            from posthog.models import OrganizationIntegration
-
-            has_integration = OrganizationIntegration.objects.filter(
-                organization=organization,
-                kind=billing_provider,  # kind matches billing_provider value
-            ).exists()
-
-            if not has_integration:
-                raise ValueError(f"Organization does not have a {billing_provider} integration configured")
-
-        data = {"billing_provider": billing_provider}
-
-        res = requests.post(
-            f"{BILLING_SERVICE_URL}/api/activate/authorize",
-            headers=self.get_auth_headers(organization, billing_provider),
-            json=data,
-        )
-
-        handle_billing_service_error(res)
-
-        return res.json()
-
-    def authorize_status(self, organization: Organization, data: dict[str, Any]):
-        res = requests.post(
-            f"{BILLING_SERVICE_URL}/api/activate/authorize/status",
-            headers=self.get_auth_headers(organization),
-            json=data,
-        )
-
-        handle_billing_service_error(res)
-
-        return res.json()
+    def authorize_status(self, organization: Organization, data: dict[str, Any]) -> dict[str, Any]:
+        return {"success": True, "status": "success"}
 
     def deauthorize(self, organization: Organization, billing_provider: BillingProvider) -> dict[str, Any]:
-        """
-        Deauthorize billing for an organization when a marketplace provider uninstalls.
-
-        This cancels the Stripe subscription and resets the billing provider to default,
-        effectively ending the customer's paid access through the marketplace.
-
-        Args:
-            organization: The organization to deauthorize billing for
-            billing_provider: The marketplace provider being uninstalled (e.g., "vercel")
-
-        Returns:
-            Response from billing service with success status
-        """
-        res = requests.post(
-            f"{BILLING_SERVICE_URL}/api/activate/authorize/uninstall",
-            headers=self.get_auth_headers(organization),
-            json={"billing_provider": billing_provider.value},
-            timeout=30,
-        )
-
-        if res.status_code == 409:
-            try:
-                data = res.json()
-            except JSONDecodeError:
-                data = {}
-            if data.get("code") == BillingAPIErrorCodes.OPEN_INVOICES_ERROR.value:
-                raise BillingServiceOpenInvoicesError(data.get("error_message", "Open invoices must be resolved first"))
-
-        handle_billing_service_error(res, valid_codes=(200,))
-
-        return res.json()
+        return {"success": True}
 
     def switch_plan(self, organization: Organization, data: dict[str, Any]) -> dict[str, Any]:
-        res = requests.post(
-            f"{BILLING_SERVICE_URL}/api/subscription/switch-plan/",
-            headers=self.get_auth_headers(organization),
-            json=data,
-        )
-
-        handle_billing_service_error(res)
-        self.update_available_product_features(organization)
-
-        return res.json()
+        return {"success": True}
 
     def apply_startup_program(self, organization: Organization, data: dict[str, Any]) -> dict[str, Any]:
-        res = requests.post(
-            f"{BILLING_SERVICE_URL}/api/startups/apply",
-            json=data,
-            headers=self.get_auth_headers(organization),
-        )
-
-        handle_billing_service_error(res)
-        return res.json()
+        return {"success": True}
 
     def claim_coupon(self, organization: Organization, data: dict[str, Any]) -> dict[str, Any]:
-        res = requests.post(
-            f"{BILLING_SERVICE_URL}/api/coupons/claim",
-            json=data,
-            headers=self.get_auth_headers(organization),
-        )
-
-        handle_billing_service_error(res)
-        return res.json()
+        return {"success": True}
 
     def coupons_overview(self, organization: Organization) -> dict[str, Any]:
-        res = requests.get(
-            f"{BILLING_SERVICE_URL}/api/coupons/overview",
-            headers=self.get_auth_headers(organization),
-        )
-
-        handle_billing_service_error(res)
-        return res.json()
+        return {"claimed_coupons": []}
 
     def get_billing_status_for_alerts(self, organization: Organization) -> dict[str, Any]:
-        """Read billing status for billing alert evaluation.
-
-        Evaluation runs as a backend job without an acting user, so the token carries the
-        billing alerts service_action claim instead of a user role claim.
-        """
-        res = requests.get(
-            f"{BILLING_SERVICE_URL}/api/billing",
-            headers=self.get_auth_headers(organization, service_action=BILLING_ALERTS_EVALUATION_SERVICE_ACTION),
-            timeout=BILLING_TIMESERIES_REQUEST_TIMEOUT,
-        )
-        handle_billing_service_error(res)
-        return res.json()
+        return dict(self._get_billing(organization))
 
     def get_usage_data(self, organization: Organization, params: dict[str, Any]) -> dict[str, Any]:
-        return self._request_with_post_fallback(organization, "/api/v2/usage/", params)
+        return {
+            "status": "ok",
+            "type": "timeseries",
+            "customer_id": organization.customer_id or "",
+            "results": [],
+            "team_id_options": [],
+        }
 
     def get_spend_data(self, organization: Organization, params: dict[str, Any]) -> dict[str, Any]:
-        return self._request_with_post_fallback(organization, "/api/v2/spend/", params)
-
-    def _request_with_post_fallback(
-        self, organization: Organization, path: str, params: dict[str, Any]
-    ) -> dict[str, Any]:
-        """
-        GET with automatic POST fallback for large payloads.
-
-        Tries GET first with query params. If the server responds with 414
-        (URI Too Long) or 431 (Request Header Fields Too Large), retries as
-        POST with a JSON body. This handles orgs with many teams whose
-        teams_map serialization exceeds URL/header limits.
-        """
-        url = f"{BILLING_SERVICE_URL}{path}"
-        headers = self.get_auth_headers(organization)
-
-        res = requests.get(
-            url,
-            headers=headers,
-            params=self._to_query_params(params),
-            timeout=BILLING_TIMESERIES_REQUEST_TIMEOUT,
-        )
-
-        if res.status_code in (414, 431):
-            logger.info(
-                "billing_get_to_post_fallback",
-                path=path,
-                status_code=res.status_code,
-                organization_id=str(organization.id),
-            )
-            res = requests.post(
-                url,
-                headers=headers,
-                json=self._to_post_body(params),
-                timeout=BILLING_TIMESERIES_REQUEST_TIMEOUT,
-            )
-
-        handle_billing_service_error(res)
-        return res.json()
-
-    @staticmethod
-    def _to_query_params(params: dict[str, Any]) -> dict[str, Any]:
-        """Serialize complex types to JSON strings for GET query params."""
-        result = {}
-        for k, v in params.items():
-            if isinstance(v, (dict, list)):
-                result[k] = json.dumps(v)
-            elif isinstance(v, UUID):
-                result[k] = str(v)
-            else:
-                result[k] = v
-        return result
-
-    @staticmethod
-    def _to_post_body(params: dict[str, Any]) -> dict[str, Any]:
-        """Convert params to a JSON-safe POST body.
-
-        Handles two conversions: UUIDs are stringified, and string values
-        that contain JSON arrays or objects (from frontend query-param
-        encoding) are parsed back into native types so the billing service
-        receives structured data rather than escaped strings.
-        """
-        result: dict[str, Any] = {}
-        for k, v in params.items():
-            if isinstance(v, UUID):
-                result[k] = str(v)
-            elif isinstance(v, str):
-                try:
-                    parsed = json.loads(v)
-                    if isinstance(parsed, (list, dict)):
-                        result[k] = parsed
-                    else:
-                        result[k] = v
-                except (json.JSONDecodeError, ValueError):
-                    result[k] = v
-            else:
-                result[k] = v
-        return result
+        return self.get_usage_data(organization, params)
 
     def handle_billing_provider_webhook(
         self,
@@ -1031,40 +381,4 @@ class BillingManager:
         organization: Organization,
         billing_provider: str,
     ) -> None:
-        """
-        Forward billing provider webhook to billing service for processing.
-
-        Pure passthrough - no transformation of event data.
-        Raises exception on failure (causes webhook endpoint to return 500, triggering provider retry).
-        """
-        body = json.dumps(
-            {
-                "event_type": event_type,
-                "event_data": event_data,
-                "billing_provider": billing_provider,
-            },
-            allow_nan=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        headers = {
-            **self.get_auth_headers(organization),
-            **build_billing_provider_webhook_signature_headers(body),
-            "Content-Type": "application/json",
-        }
-
-        res = requests.post(
-            f"{BILLING_SERVICE_URL}/api/webhooks/billing-provider",
-            headers=headers,
-            data=body,
-            timeout=30,
-        )
-
-        if not res.ok:
-            logger.error(
-                "billing_provider_webhook_error",
-                event_type=event_type,
-                billing_provider=billing_provider,
-                status_code=res.status_code,
-                response_text=res.text[:500] if res.text else "",
-            )
-            raise Exception(f"Billing service returned {res.status_code}: {res.text}")
+        return None

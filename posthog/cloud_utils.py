@@ -33,6 +33,10 @@ def is_cloud() -> bool:
     return _run_mode().is_cloud
 
 
+def is_posthog_cloud_egress_enabled() -> bool:
+    return False
+
+
 def is_dev_mode() -> bool:
     return bool(settings.DEBUG)
 

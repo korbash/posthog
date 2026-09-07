@@ -79,6 +79,7 @@ from posthog.auth import (
     SessionAuthentication,
     session_auth_required,
 )
+from posthog.cloud_utils import is_posthog_cloud_egress_enabled
 from posthog.constants import INVITE_DAYS_VALIDITY, PERMITTED_FORUM_DOMAINS
 from posthog.email import is_email_available
 from posthog.event_usage import (
@@ -2013,7 +2014,7 @@ def redirect_to_site(request):
     if toolbar_flags_key:
         params["toolbarFlagsKey"] = toolbar_flags_key
 
-    if not settings.TEST and not os.environ.get("OPT_OUT_CAPTURE"):
+    if not settings.TEST and is_posthog_cloud_egress_enabled():
         params["instrument"] = True
         params["userEmail"] = request.user.email
         params["distinctId"] = request.user.distinct_id

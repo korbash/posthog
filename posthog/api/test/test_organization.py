@@ -38,8 +38,7 @@ class TestOrganizationAPI(APIBaseTest):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         response_data = response.json()
         self.assertEqual(response_data["id"], str(self.organization.id))
-        # By default, no product features are available (can be None or [])
-        self.assertFalse(response_data["available_product_features"])
+        self.assertEqual(response_data["available_product_features"], self.organization.available_product_features)
 
         # DEPRECATED attributes
         self.assertNotIn("personalization", response_data)
@@ -59,22 +58,12 @@ class TestOrganizationAPI(APIBaseTest):
 
     # Creating organizations
 
-    def test_cant_create_organization_without_valid_license_on_self_hosted(self):
+    def test_can_create_organization_without_license_on_self_hosted(self) -> None:
         with self.is_cloud(False):
             response = self.client.post("/api/organizations/", {"name": "Test"})
-            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-            self.assertEqual(
-                response.json(),
-                {
-                    "attr": None,
-                    "code": "permission_denied",
-                    "detail": "You must upgrade your PostHog plan to be able to create and manage multiple organizations.",
-                    "type": "authentication_error",
-                },
-            )
-            self.assertEqual(Organization.objects.count(), 1)
-            response = self.client.post("/api/organizations/", {"name": "Test"})
-            self.assertEqual(Organization.objects.count(), 1)
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+            self.assertEqual(Organization.objects.count(), 2)
+            self.assertEqual(Organization.objects.get(id=response.json()["id"]).name, "Test")
 
     def test_cant_create_organization_with_custom_plugin_level(self):
         with self.is_cloud(True):
@@ -857,6 +846,13 @@ class TestOrganizationSerializer(APIBaseTest):
                 self.user_permissions = user_permissions
 
         return {"request": request, "view": MockView(UserPermissions(user))}
+
+    def test_serializes_stored_features_without_substitution(self):
+        self.organization.available_product_features = []
+
+        data = OrganizationSerializer(self.organization, context=self.context).data
+
+        assert data["available_product_features"] == []
 
     def test_get_teams_with_no_org(self):
         # Clear current_team reference before deleting organization

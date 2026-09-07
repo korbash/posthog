@@ -6,8 +6,6 @@ from django.utils import timezone
 from posthog.constants import AvailableFeature
 from posthog.models import Organization
 
-from .constants import ADVANCED_ACTIVITY_LOGS_LOOKBACK_FALLBACK_LIMIT, ADVANCED_ACTIVITY_LOGS_LOOKBACK_FALLBACK_UNIT
-
 
 def get_activity_log_lookback_restriction(organization: Organization) -> Optional[datetime]:
     """Get the lookback restriction date based on the AUDIT_LOGS feature."""
@@ -20,8 +18,7 @@ def get_activity_log_lookback_restriction(organization: Organization) -> Optiona
     unit = audit_log_feature.get("unit")
 
     if limit is None or unit is None:
-        limit = ADVANCED_ACTIVITY_LOGS_LOOKBACK_FALLBACK_LIMIT
-        unit = ADVANCED_ACTIVITY_LOGS_LOOKBACK_FALLBACK_UNIT
+        return None
 
     unit_lower = unit.lower()
     if unit_lower in ("day", "days"):

@@ -6,6 +6,7 @@ import posthoganalytics
 from dateutil.relativedelta import relativedelta
 
 from posthog.clickhouse.client import sync_execute
+from posthog.cloud_utils import is_posthog_cloud_egress_enabled
 from posthog.models import User
 from posthog.settings import SITE_URL
 
@@ -13,6 +14,9 @@ from ee.models.license import License
 
 
 def send_license_usage():
+    if not is_posthog_cloud_egress_enabled():
+        return
+
     license = License.objects.first_valid()
     user = User.objects.filter(is_active=True).first()
 

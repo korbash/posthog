@@ -5,7 +5,7 @@ from django.test import SimpleTestCase, override_settings
 
 from parameterized import parameterized
 
-from posthog.cloud_utils import is_cloud, is_hobby
+from posthog.cloud_utils import is_cloud, is_hobby, is_posthog_cloud_egress_enabled
 from posthog.run_mode import RunMode, derive_run_mode, run_mode
 
 
@@ -76,3 +76,26 @@ class TestCloudUtilsRunMode(SimpleTestCase):
         with override_settings(CLOUD_DEPLOYMENT=cloud_deployment, DEBUG=debug):
             self.assertEqual(is_cloud(), cloud)
             self.assertEqual(is_hobby(), hobby)
+
+    @parameterized.expand(
+        [
+            ("cloud", "US", False, False),
+            ("local", None, True, False),
+            ("hobby", None, False, False),
+            ("explicit_opt_out", "US", False, True),
+        ]
+    )
+    def test_cloud_egress_is_always_disabled(
+        self,
+        _name: str,
+        cloud_deployment: str | None,
+        debug: bool,
+        opt_out_capture: bool,
+    ) -> None:
+        with override_settings(
+            CLOUD_DEPLOYMENT=cloud_deployment,
+            DEBUG=debug,
+            OPT_OUT_CAPTURE=opt_out_capture,
+            TEST=False,
+        ):
+            self.assertFalse(is_posthog_cloud_egress_enabled())

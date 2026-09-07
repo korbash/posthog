@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from django.conf import settings
+
 import structlog
 from cachetools import cached
 from celery import Task, shared_task
@@ -12,6 +14,7 @@ from retry import retry
 from posthog.clickhouse.client import sync_execute
 from posthog.clickhouse.client.connection import Workload
 from posthog.clickhouse.query_tagging import Feature, Product, tags_context
+from posthog.cloud_utils import is_posthog_cloud_egress_enabled
 from posthog.exceptions_capture import capture_exception
 from posthog.logging.timing import timed_log
 from posthog.models.event.new_events_schema import events_read_table, use_new_events_schema
@@ -34,7 +37,11 @@ def get_ph_client() -> PostHogClient:
     already-reported lookup reads. A separate literal here could drift from that key, and the lookup
     would then resolve no team, report that it cannot verify, and emit without checking.
     """
-    return PostHogClient(PH_US_API_KEY, sync_mode=True)
+    return PostHogClient(
+        PH_US_API_KEY,
+        sync_mode=True,
+        disabled=settings.TEST or not is_posthog_cloud_egress_enabled(),
+    )
 
 
 AI_EVENTS = [event.value for event in AIEventType]

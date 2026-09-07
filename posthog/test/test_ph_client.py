@@ -63,12 +63,19 @@ class TestGetClientTestGuard(SimpleTestCase):
         assert client is not None
         self.assertTrue(client.disabled)
 
-    @override_settings(CLOUD_DEPLOYMENT="US")
+    @override_settings(CLOUD_DEPLOYMENT="US", TEST=False, DEBUG=False, OPT_OUT_CAPTURE=False)
     def test_explicit_enable_cannot_bypass_egress_policy(self) -> None:
-        client = get_client(disabled=False)
-        assert client is not None
-        self.assertTrue(client.disabled)
-        self.assertIsNone(client.capture(distinct_id="person", event="safe no-op"))
+        with patch(
+            "requests.sessions.Session.request", side_effect=AssertionError("Unexpected network request")
+        ) as network:
+            client = get_client(disabled=False)
+            assert client is not None
+            self.assertTrue(client.disabled)
+            self.assertIsNone(client.capture(distinct_id="person", event="safe no-op"))
+            client.metrics.count("selfhost.telemetry_probe", 1)
+            client.metrics.flush()
+            client.shutdown()
+            network.assert_not_called()
 
     def test_unknown_region_returns_nothing(self) -> None:
         self.assertIsNone(get_client(region="MARS"))

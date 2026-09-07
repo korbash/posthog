@@ -89,6 +89,7 @@ rg -n 'requests\.(get|post|patch|put|request)|httpx\.|fetch\(|sendBeacon|NewWith
 | `posthog/ph_client.py`, оба usage-report клиента                                   | Новые экземпляры SDK тоже отключены; переданный `disabled=False` не обходит запрет                 |
 | `ee/billing/billing_manager.py`, `ee/api/billing.py`, задачи usage/license reports | Ни прямые HTTP-запросы, ни новые методы не обходят локальную реализацию                            |
 | `frontend/src/loadPostHogJS.tsx`, оба layout, onboarding adblock detection         | Нет загрузки облачного SDK, capture, decide/flags, probes или дополнительных зависимостей из Cloud |
+| Страницы ошибок и публичные HTML-шаблоны                                           | Проверены автоматические загрузки iframe и скриптов; известные внешние обращения указаны в отчёте  |
 | `posthog/middleware.py`, toolbar в `posthog/api/user.py`                           | Не возвращаются адреса отправки CSP/crash reports и параметры облачной инструментации              |
 | Hobby installers и management commands                                             | Нет отправки install/dev/Helm telemetry и импорта внутренних flags из Cloud                        |
 | Новые сервисы, фоновые workers, SDK и их зависимости                               | Отдельные процессы и новые транспорты проверены независимо от Django-клиента                       |
@@ -114,6 +115,7 @@ rg -n 'requests\.(get|post|patch|put|request)|httpx\.|fetch\(|sendBeacon|NewWith
 .codex/with-flox hogli test posthog/test/test_middleware.py::TestCSPMiddleware posthog/test/test_get_context_for_template.py ee/tasks/test/test_send_license_usage.py --no-cov
 .codex/with-flox hogli test ee/api/test/test_organization.py::TestOrganizationEnterpriseAPI::test_all_known_features_are_available_without_license posthog/api/test/test_organization.py --no-cov
 .codex/with-flox hogli test ee/billing/test/test_quota_limiting.py::TestQuotaLimiting::test_local_entitlements_do_not_mutate_quota_state --no-cov
+.codex/with-flox hogli test posthog/test/activity_logging/test_retention.py posthog/api/advanced_activity_logs/test_utils.py --no-cov
 .codex/with-flox hogli test nodejs/src/common/services/quota-limiting.service.test.ts --runInBand
 .codex/with-flox hogli test rust/common/limiters/src/redis.rs
 .codex/with-flox hogli test bin/hobby-installer/core

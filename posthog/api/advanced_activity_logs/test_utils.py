@@ -1,8 +1,8 @@
 from django.test import SimpleTestCase
 
-from posthog.api.advanced_activity_logs.utils import get_activity_log_lookback_restriction
 from posthog.constants import AvailableFeature
 from posthog.models import Organization
+from posthog.models.activity_logging.retention import get_activity_log_lookback_restriction
 
 
 class TestActivityLogLookbackRestriction(SimpleTestCase):

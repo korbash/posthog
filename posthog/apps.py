@@ -6,6 +6,7 @@ from django.conf import settings
 import structlog
 import posthoganalytics
 
+from posthog.organization_caching import connect_signal_handlers as connect_organization_cache_signal_handlers
 from posthog.utils import get_available_timezones_with_offsets, get_instance_region, str_to_bool
 
 logger = structlog.get_logger(__name__)
@@ -30,6 +31,7 @@ class PostHogConfig(AppConfig):
 
         connect_signal_handlers()
         connect_gateway_credential_signal_handlers()
+        connect_organization_cache_signal_handlers()
 
         # Connect core signal receivers at app-population. They used to wire in as an import
         # side effect of viewset modules; with the lazy API router those no longer load at
